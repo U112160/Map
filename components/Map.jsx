@@ -2,7 +2,7 @@ import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap, useMapEvents 
 import 'leaflet/dist/leaflet.css';
 import { Icon, divIcon, point } from 'leaflet';
 import MarkerClusterGroup from "react-leaflet-cluster";
-import "../pages/index.css"
+import "../index.css"
 import { useMemo, useEffect, useState, useCallback } from 'react';
 import L from 'leaflet';
 
