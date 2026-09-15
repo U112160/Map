@@ -3,7 +3,7 @@ import 'leaflet/dist/leaflet.css';
 import { Icon, divIcon, point } from 'leaflet';
 import MarkerClusterGroup from "react-leaflet-cluster";
 import "../pages/index.css"
-import { useMemo, useEffect, useState } from 'react';
+import { useMemo, useEffect, useState, useCallback } from 'react';
 import L from 'leaflet';
 
 // ── 白色圓框圖示工廠 ───────────────────────────────────────────────
@@ -60,6 +60,54 @@ function getRoadsideStatusInfo(status) {
   return ROADSIDE_STATUS_MAP[status] ?? { label: `未知代碼(${status})`, color: '#9e9e9e' };
 }
 
+// 停車場「汽車剩餘車位數」的特殊代碼：
+//   -9  本停車場目前無法提供即時車位數資訊
+//   -11 沒有確切格數，但剩餘格位足夠
+//   -12 沒有確切格數，剩餘格位不足半數
+//   -13 沒有確切格數，剩餘格數嚴重不足
+//   >=0 實際剩餘車位數
+const CAR_AVAIL_CODE = {
+  '-9':  '目前無法提供即時資訊',
+  '-11': '剩餘車位足夠',
+  '-12': '剩餘車位不足半數',
+  '-13': '剩餘車位嚴重不足',
+};
+function formatCarAvailability(value) {
+  if (value == null) return '無資料';
+  if (value >= 0) return `${value} 位`;
+  return CAR_AVAIL_CODE[String(value)] ?? '無資料';
+}
+
+// 隊友 /api/parking/lots/dynamic 的 updatetime 是 Java Date.toString() 格式，
+// 例如 "Mon Sep 14 14:53:00 CST 2026"。JS 內建的 new Date() 解析這種格式時，
+// "CST" 縮寫是歧義的（常被當成美國中部時區 UTC-6，不是台灣的 UTC+8，差 14 小時），
+// 所以自己手動解析，時區一律當成台北時間，不管字串裡寫的縮寫是什麼。
+const MONTH_MAP = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+function parseJavaDateString(raw) {
+  const m = raw.match(/^\w{3} (\w{3}) (\d{2}) (\d{2}):(\d{2}):(\d{2}) \w+ (\d{4})$/);
+  if (!m) return null;
+  const [, monStr, day, hh, mm, ss, year] = m;
+  const month = MONTH_MAP[monStr];
+  if (month == null) return null;
+  const iso = `${year}-${String(month + 1).padStart(2, '0')}-${day}T${hh}:${mm}:${ss}+08:00`;
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// 隊友 API 回來的時間字串有時候沒有時區標記（沒有結尾的 Z 或 +08:00），
+// 這種情況一律當成台北時間 (+08:00) 解析，避免被瀏覽器誤判成 UTC，
+// 顯示出來變成晚 8 小時的「未來時間」。
+function formatApiTime(raw) {
+  if (!raw) return null;
+
+  const javaDate = parseJavaDateString(raw);
+  if (javaDate) return javaDate.toLocaleString('zh-TW');
+
+  const hasTimezone = /Z$|[+-]\d{2}:?\d{2}$/.test(raw);
+  const d = new Date(hasTimezone ? raw : `${raw}+08:00`);
+  return isNaN(d.getTime()) ? null : d.toLocaleString('zh-TW');
+}
+
 // ── zoom 閾值：低於此數字就不顯示對應 marker ────────────────────────
 const ZOOM_SHOW_MRT      = 14;  // 捷運出口
 const ZOOM_SHOW_UBIKE    = 15;  // YouBike 站點
@@ -98,7 +146,6 @@ export default function Map({
   mrtExits = [],
   start,
   end,
-  dropoffMode,
   priorityMode,
   routeResult,
   onMapMove,
@@ -114,12 +161,26 @@ export default function Map({
   const recommendedParkingIcon= useMemo(() => makeCircleIcon('/parking-recommended.png',      22, 5), []);
 
   // 路邊停車格：依狀態碼上色（0=未知/灰、1=已佔用/紅、2=空位/綠）
+  // 路邊停車格：依狀態碼上色（0=未知/灰、1=已佔用/紅、2=空位/綠），
+  // 有充電樁的用不同圖示（roadside-parking-charging.png）疊加同一套顏色
   const roadsideIconByStatus = useMemo(() => ({
-    '0': makeStatusCircleIcon('/roadside-parking.png', ROADSIDE_STATUS_MAP['0'].color, 18, 4),
-    '1': makeStatusCircleIcon('/roadside-parking.png', ROADSIDE_STATUS_MAP['1'].color, 18, 4),
-    '2': makeStatusCircleIcon('/roadside-parking.png', ROADSIDE_STATUS_MAP['2'].color, 18, 4),
+    '0': {
+      normal:   makeStatusCircleIcon('/roadside-parking.png',          ROADSIDE_STATUS_MAP['0'].color, 18, 4),
+      charging: makeStatusCircleIcon('/roadside-parking-charging.png', ROADSIDE_STATUS_MAP['0'].color, 18, 4),
+    },
+    '1': {
+      normal:   makeStatusCircleIcon('/roadside-parking.png',          ROADSIDE_STATUS_MAP['1'].color, 18, 4),
+      charging: makeStatusCircleIcon('/roadside-parking-charging.png', ROADSIDE_STATUS_MAP['1'].color, 18, 4),
+    },
+    '2': {
+      normal:   makeStatusCircleIcon('/roadside-parking.png',          ROADSIDE_STATUS_MAP['2'].color, 18, 4),
+      charging: makeStatusCircleIcon('/roadside-parking-charging.png', ROADSIDE_STATUS_MAP['2'].color, 18, 4),
+    },
   }), []);
-  const roadsideIconUnknown = useMemo(() => makeStatusCircleIcon('/roadside-parking.png', '#9e9e9e', 18, 4), []);
+  const roadsideIconUnknown = useMemo(() => ({
+    normal:   makeStatusCircleIcon('/roadside-parking.png',          '#9e9e9e', 18, 4),
+    charging: makeStatusCircleIcon('/roadside-parking-charging.png', '#9e9e9e', 18, 4),
+  }), []);
 
   // 起終點保留原本的 pin 造型，不加圓框
   const startIcon = useMemo(() => new Icon({
@@ -130,22 +191,25 @@ export default function Map({
   }), []);
 
   // ── Cluster 圖示 ──────────────────────────────────────────────────
-  const createCustomClusterIcon = (cluster) => new divIcon({
+  // 用 useCallback 固定住這幾個函式的參考，避免每次父層重新渲染
+  // （例如 4 批資料各自非同步回來時）都被 MarkerClusterGroup 當成
+  // 「iconCreateFunction 變了」而重建整群 marker，導致開著的 popup 閃爍
+  const createCustomClusterIcon = useCallback((cluster) => new divIcon({
     html: `<div class="cluster-icon">${cluster.getChildCount()}</div>`,
     className: "custom-marker-icon", iconSize: point(33, 33, true),
-  });
-  const createRoadsideClusterIcon = (cluster) => new divIcon({
+  }), []);
+  const createRoadsideClusterIcon = useCallback((cluster) => new divIcon({
     html: `<div class="cluster-icon cluster-icon--roadside">${cluster.getChildCount()}</div>`,
     className: "custom-marker-icon", iconSize: point(33, 33, true),
-  });
-  const createUbikeClusterIcon = (cluster) => new divIcon({
+  }), []);
+  const createUbikeClusterIcon = useCallback((cluster) => new divIcon({
     html: `<div class="cluster-icon cluster-icon--ubike">${cluster.getChildCount()}</div>`,
     className: "custom-marker-icon", iconSize: point(33, 33, true),
-  });
-  const createMrtClusterIcon = (cluster) => new divIcon({
+  }), []);
+  const createMrtClusterIcon = useCallback((cluster) => new divIcon({
     html: `<div class="cluster-icon cluster-icon--mrt">${cluster.getChildCount()}</div>`,
     className: "custom-marker-icon", iconSize: point(33, 33, true),
-  });
+  }), []);
 
   // ── 路線座標轉換 ───────────────────────────────────────────────────
   const routePositions = useMemo(() => {
@@ -168,19 +232,19 @@ export default function Map({
       <MarkerClusterGroup chunkedLoading iconCreateFunction={createCustomClusterIcon}>
         {data.map((item, index) => (
           <Marker key={index} position={[item.lat, item.lng]} icon={customIcon}>
-            <Popup>
+            <Popup autoPan={false}>
               <b>{item.name}</b><br />
               {item.address}<br />
-              剩餘汽車位：{item.available_count}<br />
+              剩餘汽車位：{formatCarAvailability(item.available_count)}<br />
               剩餘機車位：{item.available_motor}<br />
               {item.payex && <><small>{item.payex}</small><br /></>}
               {item.updatetime && (
                 <small style={{ color: '#888' }}>
-                  更新：{new Date(item.updatetime).toLocaleString('zh-TW')}
+                  更新：{formatApiTime(item.updatetime)}
                 </small>
               )}
-            </Popup>
-          </Marker>
+              </Popup>
+            </Marker>
         ))}
       </MarkerClusterGroup>
 
@@ -193,7 +257,7 @@ export default function Map({
               position={[exit.lat, exit.lon]}
               icon={mrtExitIcon}
             >
-              <Popup>
+              <Popup autoPan={false}>
                 <b>{exit.station_name_zh} {exit.exit_name_zh}</b><br />
                 {exit.location_description}<br />
                 {exit.has_stair ? '有樓梯　' : ''}
@@ -214,7 +278,7 @@ export default function Map({
               position={[station.lat, station.lon]}
               icon={ubikeIcon}
             >
-              <Popup>
+              <Popup autoPan={false}>
                 <b>{station.name_zh}</b><br />
                 {station.address_zh}<br />
                 可借：{station.available_rent ?? '-'} 台
@@ -223,7 +287,7 @@ export default function Map({
                 站點容量：{station.bikes_capacity}<br />
                 {station.update_time && (
                   <small style={{ color: '#888' }}>
-                    更新：{new Date(station.update_time).toLocaleString('zh-TW')}
+                    更新：{formatApiTime(station.update_time)}
                   </small>
                 )}
               </Popup>
@@ -234,6 +298,7 @@ export default function Map({
 
       {/* ── 路邊停車格（zoom >= 16，cluster 整合）──
           依 status 代碼上色：0=未知(灰)、1=已佔用(紅)、2=空位(綠)
+          有充電樁的用 roadside-parking-charging.png 圖示
       */}
       {zoom >= ZOOM_SHOW_ROADSIDE && (
         <MarkerClusterGroup chunkedLoading iconCreateFunction={createRoadsideClusterIcon}>
@@ -241,15 +306,30 @@ export default function Map({
             .filter((spot) => typeof spot.lat === 'number' && typeof spot.lng === 'number')
             .map((spot) => {
               const statusInfo = getRoadsideStatusInfo(spot.status);
+              const iconSet = roadsideIconByStatus[spot.status] ?? roadsideIconUnknown;
+              const icon = spot.has_charging ? iconSet.charging : iconSet.normal;
               return (
                 <Marker
                   key={`roadside-${spot.pkid}`}
                   position={[spot.lat, spot.lng]}
-                  icon={roadsideIconByStatus[spot.status] ?? roadsideIconUnknown}
+                  icon={icon}
                 >
-                  <Popup>
+                  <Popup autoPan={false}>
                     <b>路邊停車格 {spot.pkid}</b><br />
+                    {spot.segment_name_zh && <>路段：{spot.segment_name_zh}<br /></>}
                     狀態：<span style={{ color: statusInfo.color, fontWeight: 'bold' }}>{statusInfo.label}</span><br />
+                    {spot.has_charging && <>⚡ 有充電樁<br /></>}
+                    {spot.feeSchedule && spot.feeSchedule.length > 0 && (
+                      <>
+                        收費：
+                        {spot.feeSchedule.map((f, i) => (
+                          <div key={i} style={{ marginLeft: 8 }}>
+                            {f.startTime}–{f.endTime}：${f.price}
+                            {f.rateName && <small style={{ color: '#888' }}>（{f.rateName}）</small>}
+                          </div>
+                        ))}
+                      </>
+                    )}
                     {spot.distance_km != null && (
                       <small style={{ color: '#888' }}>
                         距離：{spot.distance_km.toFixed(2)} 公里
@@ -277,7 +357,7 @@ export default function Map({
           position={[spot.lat, spot.lng]}
           icon={recommendedParkingIcon}
         >
-          <Popup>
+          <Popup autoPan={false}>
             <b>🅿️ {spot.name}</b><br />
             費率：{spot.fee} 元/小時<br />
             車位類型：{spot.spaceType}<br />
@@ -290,12 +370,12 @@ export default function Map({
       {/* ── 起終點（不 cluster）── */}
       {start && (
         <Marker position={[start.lat, start.lng]} icon={startIcon}>
-          <Popup>起點：{start.name}</Popup>
+          <Popup autoPan={false}>起點：{start.name}</Popup>
         </Marker>
       )}
       {end && (
         <Marker position={[end.lat, end.lng]} icon={endIcon}>
-          <Popup>終點：{end.name}</Popup>
+          <Popup autoPan={false}>終點：{end.name}</Popup>
         </Marker>
       )}
     </MapContainer>
