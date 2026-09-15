@@ -2,7 +2,6 @@ import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap, useMapEvents 
 import 'leaflet/dist/leaflet.css';
 import { Icon, divIcon, point } from 'leaflet';
 import MarkerClusterGroup from "react-leaflet-cluster";
-import "../index.css"
 import { useMemo, useEffect, useState, useCallback } from 'react';
 import L from 'leaflet';
 
@@ -50,7 +49,7 @@ function makeStatusCircleIcon(iconUrl, bgColor, size = 18, padding = 4, shadow =
   });
 }
 
-// ── 路邊停車格狀態碼對照表（依隊友 API 文件）─────────────────────────
+// ── 路邊停車格狀態碼對照表 ─────────────────────────
 const ROADSIDE_STATUS_MAP = {
   '0': { label: '未知',  color: '#9e9e9e' }, // 灰色
   '1': { label: '已佔用', color: '#e53935' }, // 紅色
