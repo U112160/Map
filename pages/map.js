@@ -61,6 +61,18 @@ export default function MapPage() {
   // 避免舊請求一直占著連線，把新請求排在後面拖慢
   const abortControllerRef = useRef(null);
 
+  // 上一次真正套用到畫面上的資料「內容特徵」，重新抓到資料後先比對，
+  // 內容其實沒變就直接跳過 setState，連那一次重新渲染都不要發生
+  // （react-leaflet-cluster 只要一重新渲染，開著的 popup 就會閃一下，
+  // 這是套件本身的已知瑕疵：https://github.com/akursat/react-leaflet-cluster/issues/38）
+  const lastSignatureRef = useRef({ data: '', roadsideSpots: '', ubikeStations: '', mrtExits: '' });
+  function setIfChanged(key, setter, newValue) {
+    const sig = JSON.stringify(newValue);
+    if (lastSignatureRef.current[key] === sig) return; // 內容沒變，不觸發重新渲染
+    lastSignatureRef.current[key] = sig;
+    setter(newValue);
+  }
+
   // 收費費率表（rate_id → 費率資料）：整份表不吃座標參數，只在掛載時抓一次，
   // 不用跟著地圖移動重抓。用 ref 存一份給 fetchAllData（它是空 deps 的
   // useCallback）讀最新值，避免閉包抓到舊的 state。
@@ -365,15 +377,15 @@ export default function MapPage() {
     ]);
 
     if (requestIdRef.current === requestId) {
-      // 一次套用，讓 React 18 合併成一次重新渲染
-      if (mrtRes.status === 'fulfilled') setMrtExits(mrtRes.value);
-      else setMrtExits([]);
+      // 一次套用，讓 React 18 合併成一次重新渲染；內容沒變就直接跳過
+      if (mrtRes.status === 'fulfilled') setIfChanged('mrtExits', setMrtExits, mrtRes.value);
+      else setIfChanged('mrtExits', setMrtExits, []);
 
-      if (lotsRes.status === 'fulfilled') setData(lotsRes.value.data);
-      else setData([]);
+      if (lotsRes.status === 'fulfilled') setIfChanged('data', setData, lotsRes.value.data);
+      else setIfChanged('data', setData, []);
 
-      if (ubikeRes.status === 'fulfilled') setUbikeStations(ubikeRes.value.data);
-      else setUbikeStations([]);
+      if (ubikeRes.status === 'fulfilled') setIfChanged('ubikeStations', setUbikeStations, ubikeRes.value.data);
+      else setIfChanged('ubikeStations', setUbikeStations, []);
 
       if (mrtRes.status !== 'fulfilled') {
         addToast('warning', '捷運出口資料載入失敗', `${mrtRes.reason}，部分地圖資訊可能不顯示`);
@@ -414,7 +426,7 @@ export default function MapPage() {
 
           if (spotResult.status !== 'fulfilled') {
             addToast('warning', '路邊停車格資料載入失敗', `${spotResult.reason}，部分地圖資訊可能不顯示`);
-            setRoadsideSpots([]);
+            setIfChanged('roadsideSpots', setRoadsideSpots, []);
             return;
           }
           const spots = spotResult.value;
@@ -482,17 +494,17 @@ export default function MapPage() {
                 feeSchedule,
               };
             });
-          setRoadsideSpots(merged);
+          setIfChanged('roadsideSpots', setRoadsideSpots, merged);
         } catch (err) {
           if (requestIdRef.current !== requestId) return;
           if (err.name !== 'AbortError') {
             addToast('warning', '路邊停車格資料載入失敗', `${err.message}，部分地圖資訊可能不顯示`);
-            setRoadsideSpots([]);
+            setIfChanged('roadsideSpots', setRoadsideSpots, []);
           }
         }
       })();
     } else {
-      setRoadsideSpots([]);
+      setIfChanged('roadsideSpots', setRoadsideSpots, []);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
