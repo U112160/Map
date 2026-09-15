@@ -1,23 +1,20 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import dynamic from 'next/dynamic';
 
-// ── 頁面外部資源 ─────────────────────────────────────────────────
-import { mockRouteResult } from './lib/mockRouteResult';
-import { toCoords, splitRouteIntoLegs, buildGoogleMapsUrl, transportModesToString } from './lib/routeUtils';
-import { useToast } from './hooks/useToast';
-
-// ── UI 元件 ──────────────────────────────────────────────────────
-import { SearchInput } from './components/ui/SearchInput';
-import { PreferenceToggle } from './components/ui/PreferenceToggle';
-import { CheckboxGroup } from './components/ui/CheckboxGroup';
-import { PriceLimitInput } from './components/ui/PriceLimitInput';
-import { DistanceLimitInput } from './components/ui/DistanceLimitInput';
-import { PrimaryButton, SecondaryButton } from './components/ui/Buttons';
-import { RouteSummary } from './components/ui/RouteSummary';
-import { DraggablePanel } from './components/ui/DraggablePanel';
-import { ToastContainer } from './components/Toast';
-import { DisclaimerModal } from './components/DisclaimerModal';
-import { BugReportModal } from './components/BugReportModal';
+import { mockRouteResult } from '../lib/mockRouteResult';
+import { toCoords, splitRouteIntoLegs, buildGoogleMapsUrl, transportModesToString } from '../lib/routeUtils';
+import { useToast } from '../hooks/useToast';
+import { SearchInput } from '../components/ui/SearchInput';
+import { PreferenceToggle } from '../components/ui/PreferenceToggle';
+import { CheckboxGroup } from '../components/ui/CheckboxGroup';
+import { PriceLimitInput } from '../components/ui/PriceLimitInput';
+import { DistanceLimitInput } from '../components/ui/DistanceLimitInput';
+import { PrimaryButton, SecondaryButton } from '../components/ui/Buttons';
+import { RouteSummary } from '../components/ui/RouteSummary';
+import { DraggablePanel } from '../components/ui/DraggablePanel';
+import { ToastContainer } from '../components/Toast';
+import { DisclaimerModal } from '../components/DisclaimerModal';
+import { BugReportModal } from '../components/BugReportModal';
 
 // 地圖不能在伺服器端渲染（Leaflet 需要 window/document），改用動態載入，
 // 且 Map.jsx 現在放在專案根目錄的 components/，不是 pages/components/，
