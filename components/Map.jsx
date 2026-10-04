@@ -217,12 +217,18 @@ export default function Map({
   }, [routeResult]);
 
   return (
-    <MapContainer center={[25.0330, 121.5654]} zoom={13} style={{ height: '100vh', width: '100%' }}>
+    <MapContainer 
+      center={[25.0330, 121.5654]} 
+      zoom={13} 
+      maxZoom={19}
+      style={{ height: '100vh', width: '100%' }}
+    >
       <TileLayer
-        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-        maxZoom={19}
-      />
+  attribution='Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ, TomTom, Intermap, iPC, USGS, FAO, NPS, NRCAN, GeoBase, Kadaster NL, Ordnance Survey, Esri Japan, METI, Esri China (Hong Kong), and the GIS User Community'
+  url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}"
+  maxNativeZoom={18}
+  maxZoom={19}
+/>
 
       <FlyToLocation start={start} end={end} />
       <MapEventHandler onMapMove={onMapMove} onZoomChange={setZoom} />

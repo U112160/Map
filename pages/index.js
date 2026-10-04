@@ -1,8 +1,7 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import dynamic from 'next/dynamic';
 
-import { mockRouteResult } from '../lib/mockRouteResult';
-import { toCoords, splitRouteIntoLegs, buildGoogleMapsUrl, transportModesToString } from '../lib/routeUtils';
+import { toCoords, splitRouteIntoLegs, transportModesToString, normalizeRouteResult, buildGoogleMapsUrl } from '../lib/routeUtils';
 import { useToast } from '../hooks/useToast';
 import { SearchInput } from '../components/ui/SearchInput';
 import { PreferenceToggle } from '../components/ui/PreferenceToggle';
@@ -41,10 +40,18 @@ export default function MapPage() {
   const [maxDistance, setMaxDistance] = useState('500');
   const [priorityMode, setPriorityMode] = useState('space');
   const [maxPrice, setMaxPrice] = useState('');
+  // routeResult 現在存的是「正規化過」的整包多路線回應：
+  // { status, summary（整批摘要：transportMode/total_routes/available_routes）,
+  //   transfer_stations, routes: [{ mode, mode_name, available, summary（這條路線自己的）,
+  //   waypoints, routeGeometry, alongRouteParkings }, ...] }
+  // 畫在地圖上的「目前這條路線」是 routes[selectedRouteIndex]，見下面的 activeRoute
   const [routeResult, setRouteResult] = useState(null);
+  const [selectedRouteIndex, setSelectedRouteIndex] = useState(0);
   const [ubikeStations, setUbikeStations] = useState([]);
   const [mrtExits, setMrtExits] = useState([]);
   const [isPlanning, setIsPlanning] = useState(false);
+  // 目前「Maps」按鈕要帶去 /navigate 分頁的是第幾段（多段路線時用）
+  const [activeLegIndex, setActiveLegIndex] = useState(0);
   const FETCH_RADIUS = 3; // 公里，可自行調整（停車場/YouBike/捷運出口用）
   // 路邊停車格那支 API 實測 radius=3 要 20 秒，非常慢；反正路邊停車格要
   // zoom >= 16 才會顯示，那時候畫面本來就只看得到一小塊範圍，縮小查詢半徑
@@ -121,23 +128,31 @@ export default function MapPage() {
     }
   };
 
+  // 後端不管在哪種 priorityMode 下都會把 maxRate 當成硬性的價格上限來篩選，
+  // 不是只有「費率優先」才生效。所以「空間優先」「距離優先」這兩種模式，
+  // 如果照舊送 maxRate: 0，等於跟後端說「只接受免費車位」，
+  // 導致大多數地點都篩選到 0 筆、回傳 no_parking（一直沒有真正回傳過真的資料的原因）。
+  // 只有在「費率優先」時才把使用者填的上限帶進去，其他模式一律送一個
+  // 大到不會篩掉任何車位的數字，等於「不限制費率」。
+  const NO_RATE_LIMIT = 99999;
+
   function buildPayload() {
     const payload = {
       priorityMode,
       start: toCoords(start),
       end: toCoords(end),
-      maxRate: Number(maxPrice) || 0,
+      maxRate: priorityMode === 'rate' ? (Number(maxPrice) || 0) : NO_RATE_LIMIT,
       transportMode: transportModesToString(transportModes),
       maxDistance: Number(maxDistance) || 0,
     };
     return payload;
   }
 
-  // 測試用：直接載入寫死的假資料，讓「畫路線」跟「Google Maps 轉折點」這兩個功能
-  // 不用等真正的演算法接通也能測試，routeResult 一旦有值，後面的邏輯就跟真實情況完全一樣
-  function handleLoadMockRoute() {
-    setRouteResult(mockRouteResult);
-    addToast('info', '測試模式', '已載入假資料路線，可以測試地圖繪製與 Google Maps 功能');
+  // 選出一條路線當「目前顯示的」：優先選第一條 available 的，
+  // 萬一全部都不可用（理論上不該發生，後端應該會直接回 no_parking），保底選第 0 條
+  function pickInitialRouteIndex(routes) {
+    const idx = (routes || []).findIndex((r) => r.available);
+    return idx >= 0 ? idx : 0;
   }
 
   async function handlePlanRoute() {
@@ -162,8 +177,6 @@ export default function MapPage() {
     setIsPlanning(true);
     try {
       const payload = buildPayload();
-      console.log('送給演算法的 JSON:', payload); // 開發測試用：F12 → Console 可以看到完整內容
-      console.log('可直接複製的字串:', JSON.stringify(payload, null, 2));
 
       const response = await fetch('/api/plan-route', {
         method: 'POST',
@@ -192,9 +205,32 @@ export default function MapPage() {
         return;
       }
 
-      const result = await response.json();
-      setRouteResult(result);
-      console.log('路線規劃完成:', `找到 ${result.summary?.totalAvailableSpaces ?? 0} 個沿路可用車位`);
+      const raw = await response.json();
+
+      // 後端有時候會用 HTTP 200 + status 欄位來表示「沒有結果」，
+      // 不是靠 HTTP 錯誤碼，所以這裡要另外檢查 body 裡的 status。
+      // 後端改版後回傳的是「多路線」格式（routes: [...]），不是單一路線直接帶
+      // routeGeometry，所以這裡要檢查 routes 裡有沒有至少一條真的可用、
+      // 而且有路線幾何資料的路線
+      const hasUsableRoute = raw.routes?.some((r) => r.available && r.routeGeometry?.length);
+      if (raw.status !== 'success' || !hasUsableRoute) {
+        addToast(
+          'warning',
+          '找不到符合條件的路線',
+          raw.message || '目前沒有符合條件的可用車位，請嘗試放寬條件或更換起訖點'
+        );
+        setRouteResult(null);
+        return;
+      }
+
+      // 後端座標欄位用的是 lon，這裡統一轉成 App 其他地方慣用的 lat/lng
+      const normalized = normalizeRouteResult(raw);
+      setRouteResult(normalized);
+      setSelectedRouteIndex(pickInitialRouteIndex(normalized.routes));
+      setActiveLegIndex(0); // 換了新路線，舊的「目前第幾段」不一定還有效，重置回第一段
+
+      const available = normalized.routes.filter((r) => r.available).map((r) => r.mode_name).join('、');
+      console.log('路線規劃完成，可用路線：', available || '（無）');
 
     } catch (err) {
       if (err instanceof TypeError && err.message.includes('fetch')) {
@@ -208,14 +244,25 @@ export default function MapPage() {
     }
   }
 
-  // 把目前的路線結果切成多段（每段都在 Google Maps 的 10 站上限內）
+  // routeResult 現在是整包多路線回應，畫在地圖上／拿來切 Google Maps 路段的
+  // 是使用者目前選的那一條（selectedRouteIndex），不是整包本身
+  const activeRoute = routeResult?.routes?.[selectedRouteIndex] ?? null;
+
+  // 把目前選中的路線切成多段（每段都在 Google Maps 的 10 站上限內）
   // 只有在真的超過上限時才會超過 1 段，一般情況下 googleMapsLegs.length === 1
   const googleMapsLegs = useMemo(() => {
-    if (!routeResult?.routeGeometry) return [];
-    return splitRouteIntoLegs(routeResult.routeGeometry, 10);
-  }, [routeResult]);
+    if (!activeRoute?.routeGeometry) return [];
+    return splitRouteIntoLegs(activeRoute.routeGeometry, 10);
+  }, [activeRoute]);
 
-  // 開啟指定那一段的 Google Maps 導航；每次都是使用者親自點擊觸發，符合瀏覽器對開新分頁的要求
+  // 換了路線之後，legs 的段數可能變少，舊的 activeLegIndex 可能已經超出範圍，
+  // 這裡夾在有效範圍內，避免 googleMapsLegs[safeLegIndex] 變成 undefined
+  const safeLegIndex = Math.min(activeLegIndex, Math.max(0, googleMapsLegs.length - 1));
+
+  // 開啟指定那一段的 Google Maps 導航。
+  // 直接開一個新分頁連到真正的 Google Maps（不是嵌入預覽），手機上會直接
+  // 跳轉 Google Maps App 並顯示「開始導航」；桌機瀏覽器則開啟 Google Maps
+  // 網站，路線跟停靠點都已經帶好，可以直接按「開始」。
   function handleOpenGoogleMapsLeg(legIndex) {
     const leg = googleMapsLegs[legIndex];
     if (!leg) return;
@@ -636,57 +683,74 @@ export default function MapPage() {
             disabled={isPlanning}
             style={{ marginTop: 0, padding: '10px 4px', fontSize: 13, width: 'auto', flex: 1 }}
           >
-            {isPlanning ? '⏳' : '▶ 開始規劃路線'}
+            {isPlanning ? '規劃中...' : '▶ 開始規劃路線'}
           </PrimaryButton>
 
           <SecondaryButton
-            onClick={handleLoadMockRoute}
+            onClick={() => handleOpenGoogleMapsLeg(safeLegIndex)}
+            disabled={!activeRoute}
             style={{ marginTop: 0, padding: '10px 4px', fontSize: 13, width: 'auto', flex: 1 }}
           >
-            測試
+            <img
+              src="https://www.google.com/images/branding/product/ico/maps15_bnuw3a_32dp.ico"
+              width="16"
+              height="16"
+              style={{ marginRight: 4, verticalAlign: 'middle' }}
+              alt=""
+            />
+            Maps
           </SecondaryButton>
-
-          {googleMapsLegs.length <= 1 && (
-            <SecondaryButton
-              onClick={() => handleOpenGoogleMapsLeg(0)}
-              disabled={!routeResult}
-              style={{ marginTop: 0, padding: '10px 4px', fontSize: 13, width: 'auto', flex: 1 }}
-            >
-              <img
-                src="https://www.google.com/images/branding/product/ico/maps15_bnuw3a_32dp.ico"
-                width="16"
-                height="16"
-                style={{ marginRight: 4, verticalAlign: 'middle' }}
-                alt=""
-              />
-              Maps
-            </SecondaryButton>
-          )}
         </div>
 
+        {activeRoute && <RouteSummary summary={activeRoute.summary} />}
+
+        {/* 路線轉折點較多時，Google Maps 單次最多支援 10 個停靠站，
+            會自動切成多段，這裡選第幾段，按 Maps 就開啟那一段的導航 */}
         {googleMapsLegs.length > 1 && (
-          <div style={{ marginTop: 8 }}>
+          <div style={{ marginTop: 10 }}>
             <div style={{ fontSize: 11, color: '#ACBBC6', marginBottom: 6, lineHeight: 1.5 }}>
               路線轉折點較多，Google Maps 單次最多支援 10 個停靠站，
-              已自動切成 {googleMapsLegs.length} 段。請走完一段後手動點開下一段。
+              已自動切成 {googleMapsLegs.length} 段，請選擇要導航哪一段。
             </div>
-            {googleMapsLegs.map((leg, index) => (
-              <SecondaryButton
-                key={index}
-                onClick={() => handleOpenGoogleMapsLeg(index)}
-                disabled={!routeResult}
-                style={{ marginBottom: 6 }}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <button
+                onClick={() => setActiveLegIndex((i) => Math.max(0, i - 1))}
+                disabled={safeLegIndex === 0}
+                style={{
+                  width: 32,
+                  height: 32,
+                  borderRadius: 8,
+                  border: '1px solid #16254F',
+                  background: 'transparent',
+                  color: safeLegIndex === 0 ? '#3B4A63' : '#ECECEC',
+                  cursor: safeLegIndex === 0 ? 'not-allowed' : 'pointer',
+                  fontSize: 14,
+                }}
               >
-                <img
-                  src="https://www.google.com/images/branding/product/ico/maps15_bnuw3a_32dp.ico"
-                  width="16"
-                  height="16"
-                  style={{ marginRight: 6, verticalAlign: 'middle' }}
-                  alt=""
-                />
-                第 {index + 1}/{googleMapsLegs.length} 段
-              </SecondaryButton>
-            ))}
+                ←
+              </button>
+              <div style={{ flex: 1, textAlign: 'center', fontSize: 13, color: '#ECECEC' }}>
+                第 {safeLegIndex + 1} / {googleMapsLegs.length} 段
+              </div>
+              <button
+                onClick={() =>
+                  setActiveLegIndex((i) => Math.min(googleMapsLegs.length - 1, i + 1))
+                }
+                disabled={safeLegIndex === googleMapsLegs.length - 1}
+                style={{
+                  width: 32,
+                  height: 32,
+                  borderRadius: 8,
+                  border: '1px solid #16254F',
+                  background: 'transparent',
+                  color: safeLegIndex === googleMapsLegs.length - 1 ? '#3B4A63' : '#ECECEC',
+                  cursor: safeLegIndex === googleMapsLegs.length - 1 ? 'not-allowed' : 'pointer',
+                  fontSize: 14,
+                }}
+              >
+                →
+              </button>
+            </div>
           </div>
         )}
       </DraggablePanel>
@@ -793,7 +857,7 @@ export default function MapPage() {
         start={start}
         end={end}
         priorityMode={priorityMode}
-        routeResult={routeResult}
+        routeResult={activeRoute}
         onMapMove={handleMapMove}
       />
 
