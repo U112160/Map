@@ -10,13 +10,13 @@
 // 再打一次，最多在 MAX_TOTAL_WAIT_MS 內重試，成功就直接回傳結果，
 // 真的一直失敗才回報錯誤給前端。
 //
-// 注意：如果之後把這支 API 部署到 Vercel（而不是本機 next dev），
-// Vercel Serverless Function 預設有執行時間上限（Hobby 方案預設只有 10 秒，
-// 需要在 vercel.json 設定 maxDuration 才能延長），屆時 MAX_TOTAL_WAIT_MS
-// 要跟著調整，不然函式會在重試完成前就被平台強制中斷。
-
-const RETRY_DELAY_MS = 5000;      // 每次重試之間等待的時間
-const MAX_TOTAL_WAIT_MS = 100000; // 總共願意花多久去等後端醒過來
+// 部署到 Vercel 時，這支 API 的執行時間上限由 vercel.json 的
+// functions["pages/api/plan-route.js"].maxDuration 設定（目前是 60 秒，
+// Hobby 方案不需要升級付費方案也能設到這個上限）。MAX_TOTAL_WAIT_MS
+// 必須留一點緩衝在 60 秒以內，不然還沒重試完就會被平台直接砍斷連線，
+// 前端只會看到一個看不懂的 504，而不是下面這些寫好的錯誤訊息。
+const RETRY_DELAY_MS = 5000;     // 每次重試之間等待的時間
+const MAX_TOTAL_WAIT_MS = 50000; // 總共願意花多久去等後端醒過來（留 10 秒緩衝給 60 秒上限）
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));

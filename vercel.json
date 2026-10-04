@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "pages/api/plan-route.js": {
+      "maxDuration": 60
+    }
+  }
+}
