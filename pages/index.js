@@ -11,6 +11,7 @@ import { DistanceLimitInput } from '../components/ui/DistanceLimitInput';
 import { PrimaryButton, SecondaryButton } from '../components/ui/Buttons';
 import { RouteSummary } from '../components/ui/RouteSummary';
 import { DraggablePanel } from '../components/ui/DraggablePanel';
+import { StepIndicator, StepNav, STEP_COLORS } from '../components/ui/StepIndicator';
 import { ToastContainer } from '../components/Toast';
 import { DisclaimerModal } from '../components/DisclaimerModal';
 import { BugReportModal } from '../components/BugReportModal';
@@ -111,6 +112,47 @@ export default function MapPage() {
 
   // 免責聲明（預設開啟）
   const [disclaimerOpen, setDisclaimerOpen] = useState(true);
+
+  // ── 選單面板改成分步驟填寫，避免一次塞太多欄位 ──
+  // 0 起訖點 → 1 停車條件 → 2 接駁方式 → 3 規劃路線 → 4 路線結果
+  const PANEL_STEPS = ['起訖點', '停車條件', '接駁方式', '規劃路線', '路線結果'];
+  const RESULT_STEP = PANEL_STEPS.length - 1;
+  const [panelStep, setPanelStep] = useState(0);
+
+  // 每一步「能不能前進到下一步」的條件，以及不能前進時顯示的提示
+  function getStepBlocker(step) {
+    if (step === 0) {
+      if (!start) return '請先搜尋並選取起點';
+      if (!end) return '請先搜尋並選取終點';
+    }
+    if (step === 1) {
+      if (!(Number(maxDistance) > 0)) return '請填入可接受的最遠距離';
+      if (priorityMode === 'rate' && !(Number(maxPrice) > 0)) return '費率上限必須大於 0';
+    }
+    if (step === 3) {
+      // 用 routeResult（上面宣告的 state）而不是 activeRoute，
+      // activeRoute 是在更下面才宣告的 const，這裡讀會丟 ReferenceError
+      if (!routeResult) return '請先按「開始規劃路線」';
+    }
+    return null;
+  }
+  const stepBlocker = getStepBlocker(panelStep);
+
+  const goNextStep = () => {
+    if (stepBlocker) return;
+    setPanelStep((s) => Math.min(PANEL_STEPS.length - 1, s + 1));
+  };
+  const goPrevStep = () => setPanelStep((s) => Math.max(0, s - 1));
+
+  // 第 4 步顯示的條件摘要
+  const TRANSPORT_LABELS = { ubike: 'YouBike', mrt: '捷運' };
+  const conditionSummary = [
+    ['起點', start?.name || '—'],
+    ['終點', end?.name || '—'],
+    ['最遠距離', `${maxDistance || 0} 公尺`],
+    ['優先條件', priorityMode === 'rate' ? `費率優先（≤ $${maxPrice}/時）` : '車位優先'],
+    ['接駁方式', transportModes.length ? transportModes.map((m) => TRANSPORT_LABELS[m] || m).join('、') : '只走路'],
+  ];
 
   // 複選：已勾選就取消，未勾選就加入
   const handleTransportModeToggle = (mode) => {
@@ -228,6 +270,7 @@ export default function MapPage() {
       setRouteResult(normalized);
       setSelectedRouteIndex(pickInitialRouteIndex(normalized.routes));
       setActiveLegIndex(0); // 換了新路線，舊的「目前第幾段」不一定還有效，重置回第一段
+      setPanelStep(RESULT_STEP); // 規劃成功，直接跳到「路線結果」頁
 
       const available = normalized.routes.filter((r) => r.available).map((r) => r.mode_name).join('、');
       console.log('路線規劃完成，可用路線：', available || '（無）');
@@ -629,130 +672,211 @@ export default function MapPage() {
 
       {/* 蓋在最上層的資訊欄 */}
       <DraggablePanel>
-        <SearchInput
-          label="起點"
-          value={start}
-          onSelect={setStart}
-          onError={addToast}
+        <StepIndicator
+          steps={PANEL_STEPS}
+          current={panelStep}
+          onStepClick={setPanelStep}
         />
 
-        <SearchInput
-          label="終點"
-          value={end}
-          onSelect={setEnd}
-          onError={addToast}
-        />
-        
-        <DistanceLimitInput
-          label="可接受的最遠距離"
-          value={maxDistance}
-          onChange={setMaxDistance}
-        />
+        {/* 每一步的內容都保持掛載、只用 display 切換，
+            這樣 SearchInput 之類元件內部的輸入文字不會因為切換步驟而被清掉 */}
 
-        <PreferenceToggle
-          label="費率優先還是車位優先"
-          value={priorityMode}
-          onChange={handlePriorityModeChange}
-          options={[
-            { value: 'space', label: '車位優先' },
-            { value: 'rate', label: '費率優先' },
-          ]}
-        />
-
-        {priorityMode === 'rate' && (
-          <PriceLimitInput
-            label="每小時費率上限"
-            value={maxPrice}
-            onChange={setMaxPrice}
+        {/* ── 第 1 步：起訖點 ── */}
+        <div style={{ display: panelStep === 0 ? 'block' : 'none' }}>
+          <SearchInput
+            label="起點"
+            value={start}
+            onSelect={setStart}
+            onError={addToast}
           />
-        )}
+          <SearchInput
+            label="終點"
+            value={end}
+            onSelect={setEnd}
+            onError={addToast}
+          />
+        </div>
 
-        <CheckboxGroup
-          label="停車後的接駁方式（可複選）"
-          values={transportModes}
-          onToggle={handleTransportModeToggle}
-          options={[
-            { value: 'ubike', label: 'YouBike' },
-            { value: 'mrt', label: '捷運' },
-          ]}
-        />
+        {/* ── 第 2 步：停車條件 ── */}
+        <div style={{ display: panelStep === 1 ? 'block' : 'none' }}>
+          <DistanceLimitInput
+            label="可接受的最遠距離"
+            value={maxDistance}
+            onChange={setMaxDistance}
+          />
 
-        <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
+          <PreferenceToggle
+            label="費率優先還是車位優先"
+            value={priorityMode}
+            onChange={handlePriorityModeChange}
+            options={[
+              { value: 'space', label: '車位優先' },
+              { value: 'rate', label: '費率優先' },
+            ]}
+          />
+
+          {priorityMode === 'rate' && (
+            <PriceLimitInput
+              label="每小時費率上限"
+              value={maxPrice}
+              onChange={setMaxPrice}
+            />
+          )}
+        </div>
+
+        {/* ── 第 3 步：接駁方式 ── */}
+        <div style={{ display: panelStep === 2 ? 'block' : 'none' }}>
+          <CheckboxGroup
+            label="停車後的接駁方式（可複選）"
+            values={transportModes}
+            onToggle={handleTransportModeToggle}
+            options={[
+              { value: 'ubike', label: 'YouBike' },
+              { value: 'mrt', label: '捷運' },
+            ]}
+          />
+          <div style={{ fontSize: 11, color: STEP_COLORS.muted, marginTop: 6, lineHeight: 1.5 }}>
+            都不勾選代表停好車後直接走路到目的地。
+          </div>
+        </div>
+
+        {/* ── 第 4 步：確認條件 + 規劃路線 ── */}
+        <div style={{ display: panelStep === 3 ? 'block' : 'none' }}>
+          <div
+            style={{
+              border: `1px solid ${STEP_COLORS.line}`,
+              borderRadius: 8,
+              padding: '8px 10px',
+              fontSize: 12,
+              lineHeight: 1.8,
+            }}
+          >
+            {conditionSummary.map(([k, v]) => (
+              <div key={k} style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                {/* 標籤固定寬度、不換行，避免被長地址擠成直排（起/點） */}
+                <span style={{ color: STEP_COLORS.muted, whiteSpace: 'nowrap', flexShrink: 0 }}>{k}</span>
+                {/* 值只顯示一行，太長的尾巴（郵遞區號、臺灣…）用 … 省略；
+                    滑鼠移上去（title）可以看到完整地址 */}
+                <span
+                  title={v}
+                  style={{
+                    color: STEP_COLORS.text,
+                    textAlign: 'right',
+                    minWidth: 0,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {v}
+                </span>
+              </div>
+            ))}
+          </div>
+
           <PrimaryButton
             onClick={handlePlanRoute}
             disabled={isPlanning}
-            style={{ marginTop: 0, padding: '10px 4px', fontSize: 13, width: 'auto', flex: 1 }}
+            style={{ marginTop: 10, padding: '10px 4px', fontSize: 13 }}
           >
             {isPlanning ? '規劃中...' : '▶ 開始規劃路線'}
           </PrimaryButton>
-
-          <SecondaryButton
-            onClick={() => handleOpenGoogleMapsLeg(safeLegIndex)}
-            disabled={!activeRoute}
-            style={{ marginTop: 0, padding: '10px 4px', fontSize: 13, width: 'auto', flex: 1 }}
-          >
-            <img
-              src="https://www.google.com/images/branding/product/ico/maps15_bnuw3a_32dp.ico"
-              width="16"
-              height="16"
-              style={{ marginRight: 4, verticalAlign: 'middle' }}
-              alt=""
-            />
-            Maps
-          </SecondaryButton>
         </div>
 
-        {activeRoute && <RouteSummary summary={activeRoute.summary} />}
+        {/* ── 第 5 步：路線結果（規劃成功後自動跳到這頁）── */}
+        <div style={{ display: panelStep === RESULT_STEP ? 'block' : 'none' }}>
+          {activeRoute ? (
+            <>
+              <RouteSummary summary={activeRoute.summary} />
 
-        {/* 路線轉折點較多時，Google Maps 單次最多支援 10 個停靠站，
-            會自動切成多段，這裡選第幾段，按 Maps 就開啟那一段的導航 */}
-        {googleMapsLegs.length > 1 && (
-          <div style={{ marginTop: 10 }}>
-            <div style={{ fontSize: 11, color: '#ACBBC6', marginBottom: 6, lineHeight: 1.5 }}>
-              路線轉折點較多，Google Maps 單次最多支援 10 個停靠站，
-              已自動切成 {googleMapsLegs.length} 段，請選擇要導航哪一段。
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <button
-                onClick={() => setActiveLegIndex((i) => Math.max(0, i - 1))}
-                disabled={safeLegIndex === 0}
-                style={{
-                  width: 32,
-                  height: 32,
-                  borderRadius: 8,
-                  border: '1px solid #16254F',
-                  background: 'transparent',
-                  color: safeLegIndex === 0 ? '#3B4A63' : '#ECECEC',
-                  cursor: safeLegIndex === 0 ? 'not-allowed' : 'pointer',
-                  fontSize: 14,
-                }}
+              {/* 路線轉折點較多時，Google Maps 單次最多支援 10 個停靠站，
+                  會自動切成多段，這裡選第幾段，按 Maps 就開啟那一段的導航 */}
+              {googleMapsLegs.length > 1 && (
+                <div style={{ marginTop: 10 }}>
+                  <div style={{ fontSize: 11, color: '#ACBBC6', marginBottom: 6, lineHeight: 1.5 }}>
+                    路線轉折點較多，Google Maps 單次最多支援 10 個停靠站，
+                    已自動切成 {googleMapsLegs.length} 段，請選擇要導航哪一段。
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <button
+                      onClick={() => setActiveLegIndex((i) => Math.max(0, i - 1))}
+                      disabled={safeLegIndex === 0}
+                      style={{
+                        width: 32,
+                        height: 32,
+                        borderRadius: 8,
+                        border: '1px solid #16254F',
+                        background: 'transparent',
+                        color: safeLegIndex === 0 ? '#3B4A63' : '#ECECEC',
+                        cursor: safeLegIndex === 0 ? 'not-allowed' : 'pointer',
+                        fontSize: 14,
+                      }}
+                    >
+                      ←
+                    </button>
+                    <div style={{ flex: 1, textAlign: 'center', fontSize: 13, color: '#ECECEC' }}>
+                      第 {safeLegIndex + 1} / {googleMapsLegs.length} 段
+                    </div>
+                    <button
+                      onClick={() =>
+                        setActiveLegIndex((i) => Math.min(googleMapsLegs.length - 1, i + 1))
+                      }
+                      disabled={safeLegIndex === googleMapsLegs.length - 1}
+                      style={{
+                        width: 32,
+                        height: 32,
+                        borderRadius: 8,
+                        border: '1px solid #16254F',
+                        background: 'transparent',
+                        color: safeLegIndex === googleMapsLegs.length - 1 ? '#3B4A63' : '#ECECEC',
+                        cursor: safeLegIndex === googleMapsLegs.length - 1 ? 'not-allowed' : 'pointer',
+                        fontSize: 14,
+                      }}
+                    >
+                      →
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* 開啟 Google Maps 導航（多段時開的是上面選的那一段） */}
+              <SecondaryButton
+                onClick={() => handleOpenGoogleMapsLeg(safeLegIndex)}
+                style={{ marginTop: 10, padding: '10px 4px', fontSize: 13 }}
               >
-                ←
-              </button>
-              <div style={{ flex: 1, textAlign: 'center', fontSize: 13, color: '#ECECEC' }}>
-                第 {safeLegIndex + 1} / {googleMapsLegs.length} 段
-              </div>
-              <button
-                onClick={() =>
-                  setActiveLegIndex((i) => Math.min(googleMapsLegs.length - 1, i + 1))
-                }
-                disabled={safeLegIndex === googleMapsLegs.length - 1}
-                style={{
-                  width: 32,
-                  height: 32,
-                  borderRadius: 8,
-                  border: '1px solid #16254F',
-                  background: 'transparent',
-                  color: safeLegIndex === googleMapsLegs.length - 1 ? '#3B4A63' : '#ECECEC',
-                  cursor: safeLegIndex === googleMapsLegs.length - 1 ? 'not-allowed' : 'pointer',
-                  fontSize: 14,
-                }}
-              >
-                →
-              </button>
+                <img
+                  src="https://www.google.com/images/branding/product/ico/maps15_bnuw3a_32dp.ico"
+                  width="16"
+                  height="16"
+                  style={{ marginRight: 4, verticalAlign: 'middle' }}
+                  alt=""
+                />
+                {googleMapsLegs.length > 1
+                  ? `用 Google Maps 導航第 ${safeLegIndex + 1} 段`
+                  : '用 Google Maps 導航'}
+              </SecondaryButton>
+            </>
+          ) : (
+            <div style={{ fontSize: 12, color: STEP_COLORS.muted, textAlign: 'center', padding: '16px 0' }}>
+              還沒有路線結果，請回上一步按「開始規劃路線」。
             </div>
+          )}
+        </div>
+
+        {/* 不能前進時，告訴使用者還缺什麼 */}
+        {stepBlocker && panelStep < PANEL_STEPS.length - 1 && (
+          <div style={{ fontSize: 11, color: STEP_COLORS.muted, marginTop: 10 }}>
+            ⓘ {stepBlocker}
           </div>
         )}
+
+        <StepNav
+          current={panelStep}
+          total={PANEL_STEPS.length}
+          onPrev={goPrevStep}
+          onNext={goNextStep}
+          nextDisabled={!!stepBlocker}
+        />
       </DraggablePanel>
 
       {/* 右下角浮動按鈕群 */}
