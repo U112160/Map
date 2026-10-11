@@ -12,6 +12,7 @@ import { PrimaryButton, SecondaryButton } from '../components/ui/Buttons';
 import { RouteSummary } from '../components/ui/RouteSummary';
 import { DraggablePanel } from '../components/ui/DraggablePanel';
 import { StepIndicator, StepNav, STEP_COLORS } from '../components/ui/StepIndicator';
+import { MobileDrawer, useIsMobile } from '../components/ui/MobileDrawer';
 import { ToastContainer } from '../components/Toast';
 import { DisclaimerModal } from '../components/DisclaimerModal';
 import { BugReportModal } from '../components/BugReportModal';
@@ -118,6 +119,11 @@ export default function MapPage() {
   const PANEL_STEPS = ['起訖點', '停車條件', '接駁方式', '規劃路線', '路線結果'];
   const RESULT_STEP = PANEL_STEPS.length - 1;
   const [panelStep, setPanelStep] = useState(0);
+
+  // 手機版：面板改成左側可收起的抽屜；電腦版維持原本可拖曳的 DraggablePanel
+  // isMobile 一開始是 null（伺服器端還不知道螢幕寬度），知道之前先不渲染面板
+  const isMobile = useIsMobile();
+  const [drawerOpen, setDrawerOpen] = useState(true);
 
   // 每一步「能不能前進到下一步」的條件，以及不能前進時顯示的提示
   function getStepBlocker(step) {
@@ -271,6 +277,9 @@ export default function MapPage() {
       setSelectedRouteIndex(pickInitialRouteIndex(normalized.routes));
       setActiveLegIndex(0); // 換了新路線，舊的「目前第幾段」不一定還有效，重置回第一段
       setPanelStep(RESULT_STEP); // 規劃成功，直接跳到「路線結果」頁
+      // 手機畫面小，規劃成功後自動收起抽屜，讓使用者先看到地圖上的路線；
+      // 再點把手打開就會停在「路線結果」頁，可以按 Google Maps 導航
+      if (isMobile) setDrawerOpen(false);
 
       const available = normalized.routes.filter((r) => r.available).map((r) => r.mode_name).join('、');
       console.log('路線規劃完成，可用路線：', available || '（無）');
@@ -654,6 +663,12 @@ export default function MapPage() {
     }
   }, [addToast]);
 
+  // 面板外殼：手機用抽屜、電腦用可拖曳面板，裡面的步驟內容兩邊共用
+  const PanelShell = isMobile ? MobileDrawer : DraggablePanel;
+  const panelShellProps = isMobile
+    ? { open: drawerOpen, onToggle: () => setDrawerOpen((o) => !o) }
+    : {};
+
   return (
     <div style={{ position: 'relative' }}>
       {/* 免責聲明 Modal */}
@@ -671,7 +686,8 @@ export default function MapPage() {
       )}
 
       {/* 蓋在最上層的資訊欄 */}
-      <DraggablePanel>
+      {isMobile !== null && (
+      <PanelShell {...panelShellProps}>
         <StepIndicator
           steps={PANEL_STEPS}
           current={panelStep}
@@ -877,7 +893,8 @@ export default function MapPage() {
           onNext={goNextStep}
           nextDisabled={!!stepBlocker}
         />
-      </DraggablePanel>
+      </PanelShell>
+      )}
 
       {/* 右下角浮動按鈕群 */}
       <div

@@ -125,7 +125,13 @@ export function SearchInput({ label, value, onSelect, onError }) {
           onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
           placeholder={`搜尋${label}...`}
           style={{
+            // <input> 預設有大約 20 個字寬的最小寬度，光寫 flex: 1 縮不下去，
+            // 會把兩邊的按鈕擠扁（「搜尋」被折成兩行）。
+            // minWidth: 0 讓它可以縮到只佔「剩下的空間」
             flex: 1,
+            minWidth: 0,
+            width: 0,
+            boxSizing: 'border-box',
             padding: '8px 10px',
             fontSize: 13,
             border: '1px solid #16254F',
@@ -139,7 +145,9 @@ export function SearchInput({ label, value, onSelect, onError }) {
           onClick={handleSearch}
           disabled={loading}
           style={{
-            padding: '8px 14px',
+            flexShrink: 0,        // 不要被輸入框擠窄
+            whiteSpace: 'nowrap', // 「搜尋」兩個字不換行
+            padding: '8px 12px',
             fontSize: 13,
             fontWeight: 700,
             color: '#060817',
