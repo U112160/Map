@@ -157,7 +157,7 @@ export default function MapPage() {
     ['終點', end?.name || '—'],
     ['最遠距離', `${maxDistance || 0} 公尺`],
     ['優先條件', priorityMode === 'rate' ? `費率優先（≤ $${maxPrice}/時）` : '車位優先'],
-    ['接駁方式', transportModes.length ? transportModes.map((m) => TRANSPORT_LABELS[m] || m).join('、') : '只走路'],
+    ['接駁方式', transportModes.length ? transportModes.map((m) => TRANSPORT_LABELS[m] || m).join('、') : '走路'],
   ];
 
   // 複選：已勾選就取消，未勾選就加入
