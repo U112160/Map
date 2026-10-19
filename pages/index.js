@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import dynamic from 'next/dynamic';
 
 import { toCoords, splitRouteIntoLegs, transportModesToString, normalizeRouteResult, buildGoogleMapsUrl } from '../lib/routeUtils';
+import { getRouteColor } from '../lib/routeColors';
 import { useToast } from '../hooks/useToast';
 import { SearchInput } from '../components/ui/SearchInput';
 import { PreferenceToggle } from '../components/ui/PreferenceToggle';
@@ -40,6 +41,10 @@ export default function MapPage() {
   const [transportModes, setTransportModes] = useState([]);
   // 可接受的最遠距離（公尺）：跟 maxPrice 同一種「使用者自訂上限」的做法
   const [maxDistance, setMaxDistance] = useState('500');
+  // 接駁距離（公尺）：放在「接駁方式」那一步，捷運、YouBike 各自一個，
+  // 預設 500、每格 100，只有勾選該接駁方式時才會顯示、才會送給後端
+  const [mrtDistance, setMrtDistance] = useState('500');
+  const [ubikeDistance, setUbikeDistance] = useState('500');
   const [priorityMode, setPriorityMode] = useState('space');
   const [maxPrice, setMaxPrice] = useState('');
   // routeResult 現在存的是「正規化過」的整包多路線回應：
@@ -135,6 +140,12 @@ export default function MapPage() {
       if (!(Number(maxDistance) > 0)) return '請填入可接受的最遠距離';
       if (priorityMode === 'rate' && !(Number(maxPrice) > 0)) return '費率上限必須大於 0';
     }
+    if (step === 2) {
+      // 哪個接駁方式有勾，對應的接駁距離才有意義，才要求要填；
+      // 都不勾（走路）就不擋，跟費率上限只在「費率優先」時才檢查是同樣的做法
+      if (transportModes.includes('mrt') && !(Number(mrtDistance) > 0)) return '請填入捷運接駁距離';
+      if (transportModes.includes('ubike') && !(Number(ubikeDistance) > 0)) return '請填入 YouBike 接駁距離';
+    }
     if (step === 3) {
       // 用 routeResult（上面宣告的 state）而不是 activeRoute，
       // activeRoute 是在更下面才宣告的 const，這裡讀會丟 ReferenceError
@@ -158,6 +169,8 @@ export default function MapPage() {
     ['最遠距離', `${maxDistance || 0} 公尺`],
     ['優先條件', priorityMode === 'rate' ? `費率優先（≤ $${maxPrice}/時）` : '車位優先'],
     ['接駁方式', transportModes.length ? transportModes.map((m) => TRANSPORT_LABELS[m] || m).join('、') : '走路'],
+    ...(transportModes.includes('mrt') ? [['捷運接駁距離', `${mrtDistance || 0} 公尺`]] : []),
+    ...(transportModes.includes('ubike') ? [['YouBike 接駁距離', `${ubikeDistance || 0} 公尺`]] : []),
   ];
 
   // 複選：已勾選就取消，未勾選就加入
@@ -193,6 +206,11 @@ export default function MapPage() {
       transportMode: transportModesToString(transportModes),
       maxDistance: Number(maxDistance) || 0,
     };
+    // 接駁距離：只送有勾選的那幾種。
+    // ⚠️ 欄位名稱 mrtDistance / ubikeDistance 是我們前端先定的，
+    // 要跟演算法後端 /calculate 實際收的欄位名稱一致，後端若不同名請改這兩行
+    if (transportModes.includes('mrt')) payload.mrtDistance = Number(mrtDistance) || 0;
+    if (transportModes.includes('ubike')) payload.ubikeDistance = Number(ubikeDistance) || 0;
     return payload;
   }
 
@@ -751,9 +769,24 @@ export default function MapPage() {
               { value: 'mrt', label: '捷運' },
             ]}
           />
-          <div style={{ fontSize: 11, color: STEP_COLORS.muted, marginTop: 6, lineHeight: 1.5 }}>
+          <div style={{ fontSize: 11, color: STEP_COLORS.muted, marginTop: 6, marginBottom: 14, lineHeight: 1.5 }}>
             都不勾選代表停好車後直接走路到目的地。
           </div>
+
+          {transportModes.includes('mrt') && (
+            <DistanceLimitInput
+              label="捷運接駁距離"
+              value={mrtDistance}
+              onChange={setMrtDistance}
+            />
+          )}
+          {transportModes.includes('ubike') && (
+            <DistanceLimitInput
+              label="YouBike 接駁距離"
+              value={ubikeDistance}
+              onChange={setUbikeDistance}
+            />
+          )}
         </div>
 
         {/* ── 第 4 步：確認條件 + 規劃路線 ── */}
@@ -803,6 +836,58 @@ export default function MapPage() {
         <div style={{ display: panelStep === RESULT_STEP ? 'block' : 'none' }}>
           {activeRoute ? (
             <>
+              {/* 路線圖例：每條路線的顏色跟地圖上的線一致；點一下就切換成這條，
+                  下面的距離／車位統計和 Google Maps 導航都會跟著換成選中的路線 */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 4 }}>
+                {routeResult.routes.map((route, idx) => {
+                  const selected = idx === selectedRouteIndex;
+                  const color = getRouteColor(route, idx);
+                  return (
+                    <button
+                      key={route.route_index ?? idx}
+                      onClick={() => {
+                        if (!route.available) return;
+                        setSelectedRouteIndex(idx);
+                        setActiveLegIndex(0);
+                      }}
+                      disabled={!route.available}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        padding: '8px 10px',
+                        fontSize: 13,
+                        textAlign: 'left',
+                        color: !route.available ? '#3B4A63' : '#ECECEC',
+                        background: selected ? 'rgba(102, 125, 157, 0.22)' : 'transparent',
+                        border: `1px solid ${selected ? color : '#16254F'}`,
+                        borderRadius: 8,
+                        cursor: route.available ? 'pointer' : 'not-allowed',
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: 22,
+                          height: 5,
+                          borderRadius: 3,
+                          background: route.available ? color : '#3B4A63',
+                          flexShrink: 0,
+                        }}
+                      />
+                      <span style={{ flex: 1, fontWeight: selected ? 700 : 500 }}>
+                        {route.mode_name}
+                        {!route.available ? '（無路線）' : ''}
+                      </span>
+                      {route.available && route.summary?.totalDistanceMeters != null && (
+                        <span style={{ fontSize: 11, color: '#ACBBC6' }}>
+                          {(route.summary.totalDistanceMeters / 1000).toFixed(1)} 公里
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+
               <RouteSummary summary={activeRoute.summary} />
 
               {/* 路線轉折點較多時，Google Maps 單次最多支援 10 個停靠站，
@@ -998,7 +1083,8 @@ export default function MapPage() {
         start={start}
         end={end}
         priorityMode={priorityMode}
-        routeResult={activeRoute}
+        routes={routeResult?.routes || []}
+        selectedRouteIndex={selectedRouteIndex}
         onMapMove={handleMapMove}
       />
 

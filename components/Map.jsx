@@ -1,4 +1,5 @@
 import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap, useMapEvents } from 'react-leaflet';
+import { getRouteColor } from '../lib/routeColors';
 import 'leaflet/dist/leaflet.css';
 import { Icon, divIcon, point } from 'leaflet';
 import MarkerClusterGroup from "react-leaflet-cluster";
@@ -146,7 +147,8 @@ export default function Map({
   start,
   end,
   priorityMode,
-  routeResult,
+  routes = [],
+  selectedRouteIndex = 0,
   onMapMove,
 }) {
   // 目前 zoom 層級，控制哪些 marker 要渲染
@@ -211,10 +213,42 @@ export default function Map({
   }), []);
 
   // ── 路線座標轉換 ───────────────────────────────────────────────────
-  const routePositions = useMemo(() => {
-    if (!routeResult?.routeGeometry) return [];
-    return routeResult.routeGeometry.map((p) => [p.lat, p.lng]);
-  }, [routeResult]);
+  // 後端一次回傳多條路線（開車／捷運／YouBike），每條各畫一條線、顏色不同。
+  // 這幾條路線通常有一大段是同一條路（都是先開車從起點出發），如果線一樣粗，
+  // 畫在最上面的那條會把底下的完全蓋住，看起來像只有一條線。
+  // 所以越前面的路線畫越粗、越後面越細，疊在一起時每種顏色都會露出來（像套圈）。
+  // 目前選中的那條不透明，其他的稍淡。
+  const routeLines = useMemo(() => {
+    const usable = routes
+      .map((route, index) => ({ route, index }))
+      .filter(({ route }) => route?.available && route.routeGeometry?.length);
+    // Leaflet 的線疊放順序是「誰先掛上去誰在下面」，React 不會幫忙重排。
+    // 把「這次有哪幾條路線」放進 key，路線組合一變就整批重新掛上，
+    // 順序才會永遠跟陣列一致（粗的在下、細的在上）。選中哪條不影響 key，不會重畫。
+    const setKey = usable.map(({ route, index }) => route.mode || index).join('-');
+    return usable.map(({ route, index }, order) => ({
+      key: `route-${setKey}-${order}`,
+      color: getRouteColor(route, index),
+      selected: index === selectedRouteIndex,
+      weight: 5 + 3 * (usable.length - 1 - order),
+      positions: route.routeGeometry.map((p) => [p.lat, p.lng]),
+    }));
+  }, [routes, selectedRouteIndex]);
+
+  // 各條路線推薦的停車場，用 id 去重（不同路線可能推薦到同一座）
+  const recommendedParkings = useMemo(() => {
+    const seen = new Set();
+    const list = [];
+    routes.forEach((route) => {
+      if (!route?.available) return;
+      (route.alongRouteParkings || []).forEach((spot) => {
+        if (seen.has(spot.id)) return;
+        seen.add(spot.id);
+        list.push(spot);
+      });
+    });
+    return list;
+  }, [routes]);
 
   return (
     <MapContainer 
@@ -348,15 +382,20 @@ export default function Map({
       )}
 
       {/* ── 路線 ── */}
-      {routePositions.length > 0 && (
+      {routeLines.map((line) => (
         <Polyline
-          positions={routePositions}
-          pathOptions={{ color: 'blue', weight: 5, opacity: 0.7 }}
+          key={line.key}
+          positions={line.positions}
+          pathOptions={{
+            color: line.color,
+            weight: line.weight,
+            opacity: line.selected ? 1 : 0.65,
+          }}
         />
-      )}
+      ))}
 
       {/* ── 演算法推薦停車格（不 cluster，保持突出顯示）── */}
-      {routeResult?.alongRouteParkings?.map((spot) => (
+      {recommendedParkings.map((spot) => (
         <Marker
           key={`recommend-${spot.id}`}
           position={[spot.lat, spot.lng]}
