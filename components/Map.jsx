@@ -1,5 +1,6 @@
-import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap, useMapEvents } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Polyline, Circle, useMap, useMapEvents } from 'react-leaflet';
 import { getRouteColor } from '../lib/routeColors';
+import { formatCarAvailability } from '../lib/parkingFormat';
 import 'leaflet/dist/leaflet.css';
 import { Icon, divIcon, point } from 'leaflet';
 import MarkerClusterGroup from "react-leaflet-cluster";
@@ -8,14 +9,16 @@ import L from 'leaflet';
 
 // ── 白色圓框圖示工廠 ───────────────────────────────────────────────
 // size: 圖示顯示大小(px)；padding: 圓框內縮量(px)；shadow: 是否加陰影
-function makeCircleIcon(iconUrl, size = 24, padding = 4, shadow = true) {
+// ringColor: 有給就在白色圓框外圍再加一圈這個顏色的外框（用 box-shadow 畫，不會改變圖示大小）
+function makeCircleIcon(iconUrl, size = 24, padding = 4, shadow = true, ringColor = null) {
   const total = size + padding * 2;
+  const ring = ringColor ? `0 0 0 4px ${ringColor}, ` : '';
   return divIcon({
     html: `<div style="
       width:${total}px;height:${total}px;
       border-radius:50%;
       background:white;
-      box-shadow:${shadow ? '0 2px 6px rgba(0,0,0,0.35)' : 'none'};
+      box-shadow:${ring}${shadow ? '0 2px 6px rgba(0,0,0,0.35)' : 'none'};
       display:flex;align-items:center;justify-content:center;
       box-sizing:border-box;
     ">
@@ -58,24 +61,6 @@ const ROADSIDE_STATUS_MAP = {
 };
 function getRoadsideStatusInfo(status) {
   return ROADSIDE_STATUS_MAP[status] ?? { label: `未知代碼(${status})`, color: '#9e9e9e' };
-}
-
-// 停車場「汽車剩餘車位數」的特殊代碼：
-//   -9  本停車場目前無法提供即時車位數資訊
-//   -11 沒有確切格數，但剩餘格位足夠
-//   -12 沒有確切格數，剩餘格位不足半數
-//   -13 沒有確切格數，剩餘格數嚴重不足
-//   >=0 實際剩餘車位數
-const CAR_AVAIL_CODE = {
-  '-9':  '目前無法提供即時資訊',
-  '-11': '剩餘車位足夠',
-  '-12': '剩餘車位不足半數',
-  '-13': '剩餘車位嚴重不足',
-};
-function formatCarAvailability(value) {
-  if (value == null) return '無資料';
-  if (value >= 0) return `${value} 位`;
-  return CAR_AVAIL_CODE[String(value)] ?? '無資料';
 }
 
 // 隊友 /api/parking/lots/dynamic 的 updatetime 是 Java Date.toString() 格式，
@@ -124,6 +109,19 @@ function FlyToLocation({ start, end }) {
   return null;
 }
 
+// ── 進到「選擇停車場」時，把地圖縮放到剛好看得到整個搜尋範圍 ─────────
+function FitToLotSearch({ lotSearch }) {
+  const map = useMap();
+  const lat = lotSearch?.center.lat;
+  const lng = lotSearch?.center.lng;
+  const radius = lotSearch?.radius;
+  useEffect(() => {
+    if (lat == null || lng == null || !radius) return;
+    map.fitBounds(L.latLng(lat, lng).toBounds(radius * 2), { padding: [30, 30], animate: true });
+  }, [lat, lng, radius, map]);
+  return null;
+}
+
 // ── 地圖移動 / 縮放事件 ───────────────────────────────────────────
 function MapEventHandler({ onMapMove, onZoomChange }) {
   useMapEvents({
@@ -149,6 +147,8 @@ export default function Map({
   priorityMode,
   routes = [],
   selectedRouteIndex = 0,
+  lotSearch = null,   // { center: {lat,lng}, radius(公尺) }：選擇停車場時的搜尋範圍
+  selectedLot = null, // 使用者選的停車場
   onMapMove,
 }) {
   // 目前 zoom 層級，控制哪些 marker 要渲染
@@ -160,6 +160,8 @@ export default function Map({
   const ubikeIcon             = useMemo(() => makeCircleIcon('/bicycle.png',                  18, 4), []);
   const mrtExitIcon           = useMemo(() => makeCircleIcon('/MRT.png',                      18, 4), []);
   const recommendedParkingIcon= useMemo(() => makeCircleIcon('/parking-recommended.png',      22, 5), []);
+  // 使用者選定的停車場：一般停車場圖示 + 外圍一圈顏色（要換色改最後一個參數）
+  const selectedLotIcon       = useMemo(() => makeCircleIcon('/parking.png',                  22, 5, true, '#1f5dcf'), []);
 
   // 路邊停車格：依狀態碼上色（0=未知/灰、1=已佔用/紅、2=空位/綠）
   // 路邊停車格：依狀態碼上色（0=未知/灰、1=已佔用/紅、2=空位/綠），
@@ -265,6 +267,7 @@ export default function Map({
 />
 
       <FlyToLocation start={start} end={end} />
+      <FitToLotSearch lotSearch={lotSearch} />
       <MapEventHandler onMapMove={onMapMove} onZoomChange={setZoom} />
 
       {/* ── 停車場（永遠顯示，cluster 整合）── */}
@@ -393,6 +396,31 @@ export default function Map({
           }}
         />
       ))}
+
+      {/* ── 選擇停車場時的搜尋範圍圓圈 ── */}
+      {lotSearch && (
+        <Circle
+          center={[lotSearch.center.lat, lotSearch.center.lng]}
+          radius={lotSearch.radius}
+          pathOptions={{ color: '#2B8A8A', weight: 2, dashArray: '6 6', fillColor: '#2B8A8A', fillOpacity: 0.08 }}
+        />
+      )}
+
+      {/* ── 使用者選定的停車場（不 cluster，醒目圖示）── */}
+      {selectedLot && typeof selectedLot.lat === 'number' && typeof selectedLot.lng === 'number' && (
+        <Marker
+          key={`selected-lot-${selectedLot.pkid}`}
+          position={[selectedLot.lat, selectedLot.lng]}
+          icon={selectedLotIcon}
+          zIndexOffset={1000}
+        >
+          <Popup autoPan={false}>
+            <b>🅿️ {selectedLot.name}</b><br />
+            {selectedLot.address}<br />
+            剩餘汽車位：{formatCarAvailability(selectedLot.available_count)}
+          </Popup>
+        </Marker>
+      )}
 
       {/* ── 演算法推薦停車格（不 cluster，保持突出顯示）── */}
       {recommendedParkings.map((spot) => (

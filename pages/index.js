@@ -3,6 +3,7 @@ import dynamic from 'next/dynamic';
 
 import { toCoords, splitRouteIntoLegs, transportModesToString, normalizeRouteResult, buildGoogleMapsUrl } from '../lib/routeUtils';
 import { getRouteColor } from '../lib/routeColors';
+import { formatCarAvailability } from '../lib/parkingFormat';
 import { useToast } from '../hooks/useToast';
 import { SearchInput } from '../components/ui/SearchInput';
 import { PreferenceToggle } from '../components/ui/PreferenceToggle';
@@ -31,6 +32,31 @@ const MapView = dynamic(
 // 重新打開路邊停車格的抓取
 const ENABLE_ROADSIDE_PARKING = true;
 
+// 隊友的 /api/parking/lots 有時候 lat/lon 兩個欄位會反過來
+// （例如 lon 欄位裡放的其實是緯度）。台灣緯度大約在 21~26 之間、
+// 經度大約在 118~123 之間，用這個範圍自動偵測、抓反就自動校正，
+// 這樣不管隊友那邊之後有沒有修，這段都不會誤判
+function fixLatLng(lat, lon) {
+  const looksLikeLat = (v) => typeof v === 'number' && v >= 20 && v <= 27;
+  const looksLikeLon = (v) => typeof v === 'number' && v >= 117 && v <= 123;
+  if (looksLikeLon(lat) && looksLikeLat(lon)) {
+    return { lat: lon, lng: lat }; // 反了，校正回來
+  }
+  return { lat, lng: lon }; // 正常
+}
+
+// 兩個經緯度之間的直線距離（公尺）
+function haversineMeters(a, b) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
 export default function MapPage() {
   const [data, setData] = useState([]);
   const [roadsideSpots, setRoadsideSpots] = useState([]);
@@ -47,6 +73,13 @@ export default function MapPage() {
   const [ubikeDistance, setUbikeDistance] = useState('500');
   const [priorityMode, setPriorityMode] = useState('space');
   const [maxPrice, setMaxPrice] = useState('');
+  // 停車類型：'roadside' = 路邊停車格（演算法自己挑，跟以前一樣）；
+  // 'lot' = 停車場（使用者自己從範圍內的停車場挑一座，把停車場 id 送給後端）
+  const [parkingType, setParkingType] = useState('roadside');
+  const [lotCandidates, setLotCandidates] = useState([]); // 範圍內的停車場清單
+  const [lotsLoading, setLotsLoading] = useState(false);
+  const [lotsError, setLotsError] = useState(null);
+  const [selectedLotId, setSelectedLotId] = useState(null); // 使用者選的停車場 pkid
   // routeResult 現在存的是「正規化過」的整包多路線回應：
   // { status, summary（整批摘要：transportMode/total_routes/available_routes）,
   //   transfer_stations, routes: [{ mode, mode_name, available, summary（這條路線自己的）,
@@ -120,10 +153,111 @@ export default function MapPage() {
   const [disclaimerOpen, setDisclaimerOpen] = useState(true);
 
   // ── 選單面板改成分步驟填寫，避免一次塞太多欄位 ──
-  // 0 起訖點 → 1 停車條件 → 2 接駁方式 → 3 規劃路線 → 4 路線結果
-  const PANEL_STEPS = ['起訖點', '停車條件', '接駁方式', '規劃路線', '路線結果'];
-  const RESULT_STEP = PANEL_STEPS.length - 1;
+  // 起訖點 → 停車條件 → 接駁方式 →（選停車場時才有：選擇停車場）→ 規劃路線 → 路線結果
+  // 「選擇停車場」要放在接駁方式後面：停車場的搜尋範圍是由接駁距離算出來的，
+  // 使用者填完接駁距離才算得出範圍。每一步用 id 判斷，不用數字索引，
+  // 這樣有沒有多一步都不會錯位
+  const stepDefs =
+    parkingType === 'lot'
+      ? [
+          { id: 'route', label: '起訖點' },
+          { id: 'condition', label: '停車條件' },
+          { id: 'transfer', label: '接駁方式' },
+          { id: 'lot', label: '選擇停車場' },
+          { id: 'plan', label: '規劃路線' },
+          { id: 'result', label: '路線結果' },
+        ]
+      : [
+          { id: 'route', label: '起訖點' },
+          { id: 'condition', label: '停車條件' },
+          { id: 'transfer', label: '接駁方式' },
+          { id: 'plan', label: '規劃路線' },
+          { id: 'result', label: '路線結果' },
+        ];
+  const PANEL_STEPS = stepDefs.map((s) => s.label);
+  const RESULT_STEP = stepDefs.length - 1;
   const [panelStep, setPanelStep] = useState(0);
+  const stepId = stepDefs[Math.min(panelStep, RESULT_STEP)].id;
+
+  // 停車場的搜尋範圍（公尺）：以終點為圓心。
+  // 有勾捷運／YouBike 就取勾選的接駁距離中最大的那個；都沒勾（走路）就用「可接受的最遠距離」。
+  // ⚠️ 範圍怎麼定義是我的假設，要跟隊友確認；要改只需要改這裡
+  const lotRadiusMeters = useMemo(() => {
+    const picked = [];
+    if (transportModes.includes('mrt')) picked.push(Number(mrtDistance) || 0);
+    if (transportModes.includes('ubike')) picked.push(Number(ubikeDistance) || 0);
+    return picked.length ? Math.max(...picked) : Number(maxDistance) || 0;
+  }, [transportModes, mrtDistance, ubikeDistance, maxDistance]);
+
+  const selectedLot = lotCandidates.find((l) => l.pkid === selectedLotId) ?? null;
+
+  // 終點、範圍或停車類型一變，舊的候選清單和選擇就失效
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setLotCandidates([]);
+    setSelectedLotId(null);
+    setLotsError(null);
+  }, [end?.lat, end?.lng, lotRadiusMeters, parkingType]);
+
+  // 進到「選擇停車場」這一步才去抓範圍內的停車場
+  useEffect(() => {
+    if (parkingType !== 'lot' || stepId !== 'lot' || !end || !(lotRadiusMeters > 0)) return;
+    const controller = new AbortController();
+    const { signal } = controller;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setLotsLoading(true);
+    setLotsError(null);
+    (async () => {
+      try {
+        const q = `center_lat=${end.lat}&center_lon=${end.lng}&radius=${lotRadiusMeters / 1000}`;
+        const [lotsRes, dynRes] = await Promise.allSettled([
+          fetch(`/api/Parking/lots?${q}`, { signal }).then((r) => {
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            return r.json();
+          }),
+          fetch(`/api/Parking/lots-dynamic?${q}`, { signal }).then((r) => {
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            return r.json();
+          }),
+        ]);
+        if (lotsRes.status !== 'fulfilled') throw new Error(String(lotsRes.reason));
+        const dynByPkid =
+          dynRes.status === 'fulfilled' && Array.isArray(dynRes.value)
+            ? new Map(dynRes.value.map((d) => [d.pkid, d]))
+            : new Map();
+        const list = (Array.isArray(lotsRes.value) ? lotsRes.value : [])
+          .map((lot) => {
+            const { lat, lng } = fixLatLng(lot.lat, lot.lon);
+            const dyn = dynByPkid.get(lot.pkid) || {};
+            return {
+              pkid: lot.pkid,
+              name: lot.name,
+              address: lot.address,
+              payex: lot.payex,
+              lat,
+              lng,
+              available_count: dyn.available_car ?? lot.available_car ?? null,
+              distanceMeters:
+                typeof lat === 'number' && typeof lng === 'number'
+                  ? haversineMeters({ lat: end.lat, lng: end.lng }, { lat, lng })
+                  : NaN,
+            };
+          })
+          // API 的 radius 只是粗篩，這裡用實際直線距離再精確濾一次
+          .filter((l) => Number.isFinite(l.distanceMeters) && l.distanceMeters <= lotRadiusMeters)
+          .sort((a, b) => a.distanceMeters - b.distanceMeters);
+        setLotCandidates(list);
+      } catch (err) {
+        if (err.name === 'AbortError') return;
+        setLotsError(err.message || '未知錯誤');
+        setLotCandidates([]);
+      } finally {
+        if (!signal.aborted) setLotsLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [parkingType, stepId, end?.lat, end?.lng, lotRadiusMeters]);
 
   // 手機版：面板改成左側可收起的抽屜；電腦版維持原本可拖曳的 DraggablePanel
   // isMobile 一開始是 null（伺服器端還不知道螢幕寬度），知道之前先不渲染面板
@@ -132,32 +266,37 @@ export default function MapPage() {
 
   // 每一步「能不能前進到下一步」的條件，以及不能前進時顯示的提示
   function getStepBlocker(step) {
-    if (step === 0) {
+    if (step === 'route') {
       if (!start) return '請先搜尋並選取起點';
       if (!end) return '請先搜尋並選取終點';
     }
-    if (step === 1) {
+    if (step === 'condition') {
       if (!(Number(maxDistance) > 0)) return '請填入可接受的最遠距離';
-      if (priorityMode === 'rate' && !(Number(maxPrice) > 0)) return '費率上限必須大於 0';
+      // 選停車場時沒有費率優先／車位優先這個選項，不檢查費率上限
+      if (parkingType !== 'lot' && priorityMode === 'rate' && !(Number(maxPrice) > 0)) return '費率上限必須大於 0';
     }
-    if (step === 2) {
+    if (step === 'lot') {
+      if (lotsLoading) return '停車場載入中…';
+      if (!selectedLotId) return lotCandidates.length ? '請選擇一座停車場' : '範圍內沒有停車場，請回上一步調高接駁距離';
+    }
+    if (step === 'transfer') {
       // 哪個接駁方式有勾，對應的接駁距離才有意義，才要求要填；
       // 都不勾（走路）就不擋，跟費率上限只在「費率優先」時才檢查是同樣的做法
       if (transportModes.includes('mrt') && !(Number(mrtDistance) > 0)) return '請填入捷運接駁距離';
       if (transportModes.includes('ubike') && !(Number(ubikeDistance) > 0)) return '請填入 YouBike 接駁距離';
     }
-    if (step === 3) {
+    if (step === 'plan') {
       // 用 routeResult（上面宣告的 state）而不是 activeRoute，
       // activeRoute 是在更下面才宣告的 const，這裡讀會丟 ReferenceError
       if (!routeResult) return '請先按「開始規劃路線」';
     }
     return null;
   }
-  const stepBlocker = getStepBlocker(panelStep);
+  const stepBlocker = getStepBlocker(stepId);
 
   const goNextStep = () => {
     if (stepBlocker) return;
-    setPanelStep((s) => Math.min(PANEL_STEPS.length - 1, s + 1));
+    setPanelStep((s) => Math.min(RESULT_STEP, s + 1));
   };
   const goPrevStep = () => setPanelStep((s) => Math.max(0, s - 1));
 
@@ -167,7 +306,10 @@ export default function MapPage() {
     ['起點', start?.name || '—'],
     ['終點', end?.name || '—'],
     ['最遠距離', `${maxDistance || 0} 公尺`],
-    ['優先條件', priorityMode === 'rate' ? `費率優先（≤ $${maxPrice}/時）` : '車位優先'],
+    ['停車類型', parkingType === 'lot' ? '停車場' : '路邊停車格'],
+    ...(parkingType === 'lot'
+      ? [['指定停車場', selectedLot?.name || '—']]
+      : [['優先條件', priorityMode === 'rate' ? `費率優先（≤ $${maxPrice}/時）` : '車位優先']]),
     ['接駁方式', transportModes.length ? transportModes.map((m) => TRANSPORT_LABELS[m] || m).join('、') : '走路'],
     ...(transportModes.includes('mrt') ? [['捷運接駁距離', `${mrtDistance || 0} 公尺`]] : []),
     ...(transportModes.includes('ubike') ? [['YouBike 接駁距離', `${ubikeDistance || 0} 公尺`]] : []),
@@ -197,12 +339,23 @@ export default function MapPage() {
   // 大到不會篩掉任何車位的數字，等於「不限制費率」。
   const NO_RATE_LIMIT = 99999;
 
+  // 切換停車類型：舊的路線結果是用另一種類型算的，直接清掉避免誤會
+  const handleParkingTypeChange = (type) => {
+    if (type === parkingType) return;
+    setParkingType(type);
+    setRouteResult(null);
+    setSelectedRouteIndex(0);
+  };
+
   function buildPayload() {
+    const isLot = parkingType === 'lot';
     const payload = {
-      priorityMode,
+      // 選停車場時，停車場是使用者指定的，不需要費率／車位優先的篩選，
+      // 固定送 space + 不限費率
+      priorityMode: isLot ? 'space' : priorityMode,
       start: toCoords(start),
       end: toCoords(end),
-      maxRate: priorityMode === 'rate' ? (Number(maxPrice) || 0) : NO_RATE_LIMIT,
+      maxRate: !isLot && priorityMode === 'rate' ? (Number(maxPrice) || 0) : NO_RATE_LIMIT,
       transportMode: transportModesToString(transportModes),
       maxDistance: Number(maxDistance) || 0,
     };
@@ -211,6 +364,11 @@ export default function MapPage() {
     // 要跟演算法後端 /calculate 實際收的欄位名稱一致，後端若不同名請改這兩行
     if (transportModes.includes('mrt')) payload.mrtDistance = Number(mrtDistance) || 0;
     if (transportModes.includes('ubike')) payload.ubikeDistance = Number(ubikeDistance) || 0;
+    // 停車類型與使用者指定的停車場 id（pkid，就是 /api/parking/lots 回的 pkid）。
+    // ⚠️ 欄位名稱 parkingType / parkingLotId 也是我們前端先定的，要跟隊友確認；
+    // parkingType 選路邊停車格時是 'roadside'，其他欄位跟以前完全一樣
+    payload.parkingType = isLot ? 'lot' : 'roadside';
+    if (isLot) payload.parkingLotId = selectedLotId;
     return payload;
   }
 
@@ -231,11 +389,15 @@ export default function MapPage() {
       addToast('warning', '尚未選擇終點', '請先搜尋並選取終點後再規劃路線');
       return;
     }
-    if (priorityMode === 'rate' && !maxPrice) {
+    if (parkingType === 'lot' && !selectedLotId) {
+      addToast('warning', '尚未選擇停車場', '請先回到「選擇停車場」步驟挑一座停車場');
+      return;
+    }
+    if (parkingType !== 'lot' && priorityMode === 'rate' && !maxPrice) {
       addToast('warning', '請輸入費率上限', '已選擇「費率優先」，請填入每小時可接受的最高費率');
       return;
     }
-    if (priorityMode === 'rate' && Number(maxPrice) <= 0) {
+    if (parkingType !== 'lot' && priorityMode === 'rate' && Number(maxPrice) <= 0) {
       addToast('warning', '費率上限無效', '費率上限必須大於 0');
       return;
     }
@@ -409,19 +571,7 @@ export default function MapPage() {
       // 先當作「負數 = 沒資料」處理，之後如果隊友也有給這些代碼再一起改
       const validAvail = (v) => (typeof v === 'number' && v >= 0 ? v : null);
 
-      // 隊友的 /api/parking/lots 有時候 lat/lon 兩個欄位會反過來
-      // （例如 lon 欄位裡放的其實是緯度）。台灣緯度大約在 21~26 之間、
-      // 經度大約在 118~123 之間，用這個範圍自動偵測、抓反就自動校正，
-      // 這樣不管隊友那邊之後有沒有修，這段都不會誤判
-      const fixLatLng = (lat, lon) => {
-        const looksLikeLat = (v) => typeof v === 'number' && v >= 20 && v <= 27;
-        const looksLikeLon = (v) => typeof v === 'number' && v >= 117 && v <= 123;
-        if (looksLikeLon(lat) && looksLikeLat(lon)) {
-          return { lat: lon, lng: lat }; // 反了，校正回來
-        }
-        return { lat, lng: lon }; // 正常
-      };
-
+      // lat/lon 欄位可能被隊友放反，用模組層級的 fixLatLng 自動校正
       const merged = lots.map((lot) => {
         const dyn = dynamicByPkid.get(lot.pkid) || {};
         const { lat, lng } = fixLatLng(lot.lat, lot.lon);
@@ -716,7 +866,7 @@ export default function MapPage() {
             這樣 SearchInput 之類元件內部的輸入文字不會因為切換步驟而被清掉 */}
 
         {/* ── 第 1 步：起訖點 ── */}
-        <div style={{ display: panelStep === 0 ? 'block' : 'none' }}>
+        <div style={{ display: stepId === 'route' ? 'block' : 'none' }}>
           <SearchInput
             label="起點"
             value={start}
@@ -732,24 +882,42 @@ export default function MapPage() {
         </div>
 
         {/* ── 第 2 步：停車條件 ── */}
-        <div style={{ display: panelStep === 1 ? 'block' : 'none' }}>
+        <div style={{ display: stepId === 'condition' ? 'block' : 'none' }}>
+          <PreferenceToggle
+            label="想停哪一種"
+            value={parkingType}
+            onChange={handleParkingTypeChange}
+            options={[
+              { value: 'roadside', label: '路邊停車格' },
+              { value: 'lot', label: '停車場' },
+            ]}
+          />
+          {parkingType === 'lot' && (
+            <div style={{ fontSize: 11, color: STEP_COLORS.muted, marginTop: 6, marginBottom: 14, lineHeight: 1.5 }}>
+              選停車場的話，填完接駁方式後，會列出終點附近的停車場讓你自己挑一座。
+            </div>
+          )}
+
           <DistanceLimitInput
             label="可接受的最遠距離"
             value={maxDistance}
             onChange={setMaxDistance}
           />
 
-          <PreferenceToggle
-            label="費率優先還是車位優先"
-            value={priorityMode}
-            onChange={handlePriorityModeChange}
-            options={[
-              { value: 'space', label: '車位優先' },
-              { value: 'rate', label: '費率優先' },
-            ]}
-          />
+          {/* 選停車場時，停車場由使用者自己指定，不需要費率／車位優先 */}
+          {parkingType !== 'lot' && (
+            <PreferenceToggle
+              label="費率優先還是車位優先"
+              value={priorityMode}
+              onChange={handlePriorityModeChange}
+              options={[
+                { value: 'space', label: '車位優先' },
+                { value: 'rate', label: '費率優先' },
+              ]}
+            />
+          )}
 
-          {priorityMode === 'rate' && (
+          {parkingType !== 'lot' && priorityMode === 'rate' && (
             <PriceLimitInput
               label="每小時費率上限"
               value={maxPrice}
@@ -759,7 +927,7 @@ export default function MapPage() {
         </div>
 
         {/* ── 第 3 步：接駁方式 ── */}
-        <div style={{ display: panelStep === 2 ? 'block' : 'none' }}>
+        <div style={{ display: stepId === 'transfer' ? 'block' : 'none' }}>
           <CheckboxGroup
             label="停車後的接駁方式（可複選）"
             values={transportModes}
@@ -789,8 +957,66 @@ export default function MapPage() {
           )}
         </div>
 
-        {/* ── 第 4 步：確認條件 + 規劃路線 ── */}
-        <div style={{ display: panelStep === 3 ? 'block' : 'none' }}>
+        {/* ── 選擇停車場（只有停車類型選「停車場」時才會有這一步）── */}
+        {parkingType === 'lot' && (
+          <div style={{ display: stepId === 'lot' ? 'block' : 'none' }}>
+            <div style={{ fontSize: 12, color: STEP_COLORS.muted, lineHeight: 1.5, marginBottom: 8 }}>
+              終點 {lotRadiusMeters} 公尺內的停車場，請選一座：
+            </div>
+
+            {lotsLoading && (
+              <div style={{ fontSize: 12, color: STEP_COLORS.muted, padding: '12px 0', textAlign: 'center' }}>
+                載入停車場中…
+              </div>
+            )}
+            {!lotsLoading && lotsError && (
+              <div style={{ fontSize: 12, color: STEP_COLORS.muted, padding: '12px 0', textAlign: 'center' }}>
+                停車場載入失敗（{lotsError}），請稍後再試。
+              </div>
+            )}
+            {!lotsLoading && !lotsError && lotCandidates.length === 0 && (
+              <div style={{ fontSize: 12, color: STEP_COLORS.muted, padding: '12px 0', textAlign: 'center' }}>
+                範圍內沒有停車場，請回上一步調高接駁距離。
+              </div>
+            )}
+
+            {!lotsLoading && lotCandidates.length > 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 260, overflowY: 'auto' }}>
+                {lotCandidates.map((lot) => {
+                  const selected = lot.pkid === selectedLotId;
+                  return (
+                    <button
+                      key={lot.pkid}
+                      onClick={() => setSelectedLotId(lot.pkid)}
+                      style={{
+                        textAlign: 'left',
+                        padding: '8px 10px',
+                        fontSize: 13,
+                        lineHeight: 1.5,
+                        color: STEP_COLORS.text,
+                        background: selected ? 'rgba(102, 125, 157, 0.22)' : 'transparent',
+                        border: `1px solid ${selected ? STEP_COLORS.accent : STEP_COLORS.line}`,
+                        borderRadius: 8,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <div style={{ fontWeight: selected ? 700 : 500 }}>{lot.name}</div>
+                      <div style={{ fontSize: 11, color: STEP_COLORS.muted }}>
+                        距終點約 {Math.round(lot.distanceMeters)} 公尺　剩餘汽車位：{formatCarAvailability(lot.available_count)}
+                      </div>
+                      {lot.payex && (
+                        <div style={{ fontSize: 11, color: STEP_COLORS.muted }}>{lot.payex}</div>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── 確認條件 + 規劃路線 ── */}
+        <div style={{ display: stepId === 'plan' ? 'block' : 'none' }}>
           <div
             style={{
               border: `1px solid ${STEP_COLORS.line}`,
@@ -833,7 +1059,7 @@ export default function MapPage() {
         </div>
 
         {/* ── 第 5 步：路線結果（規劃成功後自動跳到這頁）── */}
-        <div style={{ display: panelStep === RESULT_STEP ? 'block' : 'none' }}>
+        <div style={{ display: stepId === 'result' ? 'block' : 'none' }}>
           {activeRoute ? (
             <>
               {/* 路線圖例：每條路線的顏色跟地圖上的線一致；點一下就切換成這條，
@@ -965,7 +1191,7 @@ export default function MapPage() {
         </div>
 
         {/* 不能前進時，告訴使用者還缺什麼 */}
-        {stepBlocker && panelStep < PANEL_STEPS.length - 1 && (
+        {stepBlocker && panelStep < RESULT_STEP && (
           <div style={{ fontSize: 11, color: STEP_COLORS.muted, marginTop: 10 }}>
             ⓘ {stepBlocker}
           </div>
@@ -1085,6 +1311,13 @@ export default function MapPage() {
         priorityMode={priorityMode}
         routes={routeResult?.routes || []}
         selectedRouteIndex={selectedRouteIndex}
+        /* 選擇停車場那一步時，地圖畫出搜尋範圍圓圈；選好的停車場一直用醒目圖示標出 */
+        lotSearch={
+          parkingType === 'lot' && stepId === 'lot' && end && lotRadiusMeters > 0
+            ? { center: { lat: end.lat, lng: end.lng }, radius: lotRadiusMeters }
+            : null
+        }
+        selectedLot={parkingType === 'lot' ? selectedLot : null}
         onMapMove={handleMapMove}
       />
 
