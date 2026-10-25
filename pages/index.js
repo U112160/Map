@@ -272,8 +272,7 @@ export default function MapPage() {
     }
     if (step === 'condition') {
       if (!(Number(maxDistance) > 0)) return '請填入可接受的最遠距離';
-      // 選停車場時沒有費率優先／車位優先這個選項，不檢查費率上限
-      if (parkingType !== 'lot' && priorityMode === 'rate' && !(Number(maxPrice) > 0)) return '費率上限必須大於 0';
+      if (priorityMode === 'rate' && !(Number(maxPrice) > 0)) return '費率上限必須大於 0';
     }
     if (step === 'lot') {
       if (lotsLoading) return '停車場載入中…';
@@ -307,9 +306,8 @@ export default function MapPage() {
     ['終點', end?.name || '—'],
     ['最遠距離', `${maxDistance || 0} 公尺`],
     ['停車類型', parkingType === 'lot' ? '停車場' : '路邊停車格'],
-    ...(parkingType === 'lot'
-      ? [['指定停車場', selectedLot?.name || '—']]
-      : [['優先條件', priorityMode === 'rate' ? `費率優先（≤ $${maxPrice}/時）` : '車位優先']]),
+    ['優先條件', priorityMode === 'rate' ? `費率優先（≤ $${maxPrice}/時）` : '車位優先'],
+    ...(parkingType === 'lot' ? [['指定停車場', selectedLot?.name || '—']] : []),
     ['接駁方式', transportModes.length ? transportModes.map((m) => TRANSPORT_LABELS[m] || m).join('、') : '走路'],
     ...(transportModes.includes('mrt') ? [['捷運接駁距離', `${mrtDistance || 0} 公尺`]] : []),
     ...(transportModes.includes('ubike') ? [['YouBike 接駁距離', `${ubikeDistance || 0} 公尺`]] : []),
@@ -350,12 +348,10 @@ export default function MapPage() {
   function buildPayload() {
     const isLot = parkingType === 'lot';
     const payload = {
-      // 選停車場時，停車場是使用者指定的，不需要費率／車位優先的篩選，
-      // 固定送 space + 不限費率
-      priorityMode: isLot ? 'space' : priorityMode,
+      priorityMode,
       start: toCoords(start),
       end: toCoords(end),
-      maxRate: !isLot && priorityMode === 'rate' ? (Number(maxPrice) || 0) : NO_RATE_LIMIT,
+      maxRate: priorityMode === 'rate' ? (Number(maxPrice) || 0) : NO_RATE_LIMIT,
       transportMode: transportModesToString(transportModes),
       maxDistance: Number(maxDistance) || 0,
     };
@@ -393,11 +389,11 @@ export default function MapPage() {
       addToast('warning', '尚未選擇停車場', '請先回到「選擇停車場」步驟挑一座停車場');
       return;
     }
-    if (parkingType !== 'lot' && priorityMode === 'rate' && !maxPrice) {
+    if (priorityMode === 'rate' && !maxPrice) {
       addToast('warning', '請輸入費率上限', '已選擇「費率優先」，請填入每小時可接受的最高費率');
       return;
     }
-    if (parkingType !== 'lot' && priorityMode === 'rate' && Number(maxPrice) <= 0) {
+    if (priorityMode === 'rate' && Number(maxPrice) <= 0) {
       addToast('warning', '費率上限無效', '費率上限必須大於 0');
       return;
     }
@@ -904,20 +900,17 @@ export default function MapPage() {
             onChange={setMaxDistance}
           />
 
-          {/* 選停車場時，停車場由使用者自己指定，不需要費率／車位優先 */}
-          {parkingType !== 'lot' && (
-            <PreferenceToggle
-              label="費率優先還是車位優先"
-              value={priorityMode}
-              onChange={handlePriorityModeChange}
-              options={[
-                { value: 'space', label: '車位優先' },
-                { value: 'rate', label: '費率優先' },
-              ]}
-            />
-          )}
+          <PreferenceToggle
+            label="費率優先還是車位優先"
+            value={priorityMode}
+            onChange={handlePriorityModeChange}
+            options={[
+              { value: 'space', label: '車位優先' },
+              { value: 'rate', label: '費率優先' },
+            ]}
+          />
 
-          {parkingType !== 'lot' && priorityMode === 'rate' && (
+          {priorityMode === 'rate' && (
             <PriceLimitInput
               label="每小時費率上限"
               value={maxPrice}
