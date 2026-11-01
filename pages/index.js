@@ -40,7 +40,7 @@ function fixLatLng(lat, lon) {
   const looksLikeLat = (v) => typeof v === 'number' && v >= 20 && v <= 27;
   const looksLikeLon = (v) => typeof v === 'number' && v >= 117 && v <= 123;
   if (looksLikeLon(lat) && looksLikeLat(lon)) {
-    return { lat: lon, lng: lat }; // 反了，校正回來
+    return { lat: lon, lng: lat }; // 顛倒，校正回來
   }
   return { lat, lng: lon }; // 正常
 }
@@ -67,6 +67,10 @@ export default function MapPage() {
   const [transportModes, setTransportModes] = useState([]);
   // 可接受的最遠距離（公尺）：跟 maxPrice 同一種「使用者自訂上限」的做法
   const [maxDistance, setMaxDistance] = useState('500');
+  // 找路邊車位時最多願意繞多遠（公尺），對應演算法 /calculate 的 maxDetour 欄位。
+  // 以前前端沒送這個欄位，後端一律用預設 1500 公尺；熱門地段路邊幾乎全滿時，
+  // 繞圈找空格的路線常常超過 1500，就會一直回「找不到符合繞路限制的停車路線」。
+  const [maxDetour, setMaxDetour] = useState('3000');
   // 接駁距離（公尺）：放在「接駁方式」那一步，捷運、YouBike 各自一個，
   // 預設 500、每格 100，只有勾選該接駁方式時才會顯示、才會送給後端
   const [mrtDistance, setMrtDistance] = useState('500');
@@ -272,6 +276,7 @@ export default function MapPage() {
     }
     if (step === 'condition') {
       if (!(Number(maxDistance) > 0)) return '請填入可接受的最遠距離';
+      if (parkingType === 'roadside' && !(Number(maxDetour) > 0)) return '請填入找車位最多繞路的距離';
       if (priorityMode === 'rate' && !(Number(maxPrice) > 0)) return '費率上限必須大於 0';
     }
     if (step === 'lot') {
@@ -306,6 +311,7 @@ export default function MapPage() {
     ['終點', end?.name || '—'],
     ['最遠距離', `${maxDistance || 0} 公尺`],
     ['停車類型', parkingType === 'lot' ? '停車場' : '路邊停車格'],
+    ...(parkingType === 'roadside' ? [['繞路上限', `${maxDetour || 0} 公尺`]] : []),
     ['優先條件', priorityMode === 'rate' ? `費率優先（≤ $${maxPrice}/時）` : '車位優先'],
     ...(parkingType === 'lot' ? [['指定停車場', selectedLot?.name || '—']] : []),
     ['接駁方式', transportModes.length ? transportModes.map((m) => TRANSPORT_LABELS[m] || m).join('、') : '走路'],
@@ -365,6 +371,8 @@ export default function MapPage() {
     // parkingType 選路邊停車格時是 'roadside'，其他欄位跟以前完全一樣
     payload.parkingType = isLot ? 'lot' : 'roadside';
     if (isLot) payload.parkingLotId = selectedLotId;
+    // 繞路上限只對路邊停車有意義（停車場是使用者自己指定的，不用繞圈找）
+    if (!isLot) payload.maxDetour = Number(maxDetour) || 0;
     return payload;
   }
 
@@ -429,7 +437,34 @@ export default function MapPage() {
         return;
       }
 
-      const raw = await response.json();
+      let raw = await response.json();
+
+      // 路邊停車找不到路線時（通常是附近路邊幾乎全滿，繞圈找空格會超過繞路上限），
+      // 自動改用 parkingType: 'both' 再問一次，讓演算法連停車場一起考慮，
+      // 免得使用者一直卡在「找不到路線」又不知道要改什麼
+      const isUsable = (data) => data?.status === 'success' && data.routes?.some((r) => r.available && r.routeGeometry?.length);
+      if (payload.parkingType === 'roadside' && !isUsable(raw)) {
+        try {
+          const fallbackRes = await fetch('/api/plan-route', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...payload, parkingType: 'both' }),
+          });
+          if (fallbackRes.ok) {
+            const fallbackRaw = await fallbackRes.json();
+            if (isUsable(fallbackRaw)) {
+              raw = fallbackRaw;
+              addToast(
+                'info',
+                '附近路邊車位已滿',
+                `在 ${maxDetour} 公尺繞路範圍內找不到路邊空位，已改為同時考慮停車場`
+              );
+            }
+          }
+        } catch (_) {
+          // 備案失敗就維持原本的結果，交給下面顯示「找不到路線」
+        }
+      }
 
       // 後端有時候會用 HTTP 200 + status 欄位來表示「沒有結果」，
       // 不是靠 HTTP 錯誤碼，所以這裡要另外檢查 body 裡的 status。
@@ -899,6 +934,19 @@ export default function MapPage() {
             value={maxDistance}
             onChange={setMaxDistance}
           />
+
+          {parkingType === 'roadside' && (
+            <>
+              <DistanceLimitInput
+                label="找車位最多繞路"
+                value={maxDetour}
+                onChange={setMaxDetour}
+              />
+              <div style={{ fontSize: 11, color: STEP_COLORS.muted, marginTop: -8, marginBottom: 14, lineHeight: 1.5 }}>
+                熱門地段路邊常常客滿，繞路範圍太小容易找不到路線；找不到時會自動改為一併考慮停車場。
+              </div>
+            </>
+          )}
 
           <PreferenceToggle
             label="費率優先還是車位優先"
