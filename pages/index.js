@@ -67,10 +67,6 @@ export default function MapPage() {
   const [transportModes, setTransportModes] = useState([]);
   // 可接受的最遠距離（公尺）：跟 maxPrice 同一種「使用者自訂上限」的做法
   const [maxDistance, setMaxDistance] = useState('500');
-  // 額外繞路距離（公尺），對應演算法 /calculate 的 maxDetour 欄位（選填）。
-  // 演算法找空格是貪婪法，有時候會「繞不動」，這個值讓它可以多繞一點；
-  // 留空就不送這個欄位，交給後端用自己的預設值。
-  const [maxDetour, setMaxDetour] = useState('');
   // 停車順序，對應演算法 /calculate 的 parkFirst 欄位：
   // false = 先開到終點放人，再自己去找車位；true = 先去停車，再走／接駁到終點
   const [parkFirst, setParkFirst] = useState(false);
@@ -279,8 +275,6 @@ export default function MapPage() {
     }
     if (step === 'condition') {
       if (!(Number(maxDistance) > 0)) return '請填入可接受的最遠距離';
-      // maxDetour 可以不填；有填的話才檢查必須是正數
-      if (parkingType === 'roadside' && maxDetour !== '' && !(Number(maxDetour) > 0)) return '額外繞路距離要大於 0，或直接留空';
       if (priorityMode === 'rate' && !(Number(maxPrice) > 0)) return '費率上限必須大於 0';
     }
     if (step === 'lot') {
@@ -316,7 +310,6 @@ export default function MapPage() {
     ['最遠距離', `${maxDistance || 0} 公尺`],
     ['停車類型', parkingType === 'lot' ? '停車場' : '路邊停車格'],
     ['停車順序', parkFirst ? '先停車再前往終點' : '先到終點放人再停車'],
-    ...(parkingType === 'roadside' ? [['額外繞路距離', maxDetour !== '' ? `${maxDetour} 公尺` : '未填（系統預設）']] : []),
     ['優先條件', priorityMode === 'rate' ? `費率優先（≤ $${maxPrice}/時）` : '車位優先'],
     ...(parkingType === 'lot' ? [['指定停車場', selectedLot?.name || '—']] : []),
     ['接駁方式', transportModes.length ? transportModes.map((m) => TRANSPORT_LABELS[m] || m).join('、') : '走路'],
@@ -377,9 +370,6 @@ export default function MapPage() {
     payload.parkingType = isLot ? 'lot' : 'roadside';
     if (isLot) payload.parkingLotId = selectedLotId;
     payload.parkFirst = parkFirst;
-    // 額外繞路距離只對路邊停車有意義（停車場是使用者自己指定的，不用繞圈找）；
-    // 沒填就整個欄位不送，讓後端用預設值
-    if (!isLot && Number(maxDetour) > 0) payload.maxDetour = Math.round(Number(maxDetour));
     return payload;
   }
 
@@ -464,9 +454,7 @@ export default function MapPage() {
               addToast(
                 'info',
                 '附近路邊車位已滿',
-                Number(maxDetour) > 0
-                  ? `在 ${maxDetour} 公尺繞路範圍內找不到路邊空位，已改為同時考慮停車場`
-                  : '附近找不到路邊空位，已改為同時考慮停車場'
+                '附近找不到路邊空位，已改為同時考慮停車場'
               );
             }
           }
@@ -953,17 +941,6 @@ export default function MapPage() {
               { value: true, label: '先停車再過去' },
             ]}
           />
-
-          {parkingType === 'roadside' && (
-            <>
-              <DistanceLimitInput
-                label="額外繞路距離（選填）"
-                value={maxDetour}
-                onChange={setMaxDetour}
-                placeholder="不填則使用系統預設"
-              />
-            </>
-          )}
 
           <PreferenceToggle
             label="費率優先還是車位優先"
