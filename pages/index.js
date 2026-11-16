@@ -89,6 +89,9 @@ export default function MapPage() {
   //   waypoints, routeGeometry, alongRouteParkings }, ...] }
   // 畫在地圖上的「目前這條路線」是 routes[selectedRouteIndex]，見下面的 activeRoute
   const [routeResult, setRouteResult] = useState(null);
+  // 規劃失敗（整批都沒有可用路線、或請求本身出錯）時的說明，顯示在「路線結果」頁：
+  // { title, message, routes: [{ mode_name, message }] }；成功或重新規劃時清掉
+  const [planFailure, setPlanFailure] = useState(null);
   const [selectedRouteIndex, setSelectedRouteIndex] = useState(0);
   const [ubikeStations, setUbikeStations] = useState([]);
   const [mrtExits, setMrtExits] = useState([]);
@@ -290,7 +293,7 @@ export default function MapPage() {
     if (step === 'plan') {
       // 用 routeResult（上面宣告的 state）而不是 activeRoute，
       // activeRoute 是在更下面才宣告的 const，這裡讀會丟 ReferenceError
-      if (!routeResult) return '請先按「開始規劃路線」';
+      if (!routeResult && !planFailure) return '請先按「開始規劃路線」';
     }
     return null;
   }
@@ -346,6 +349,7 @@ export default function MapPage() {
     if (type === parkingType) return;
     setParkingType(type);
     setRouteResult(null);
+    setPlanFailure(null);
     setSelectedRouteIndex(0);
   };
 
@@ -403,7 +407,16 @@ export default function MapPage() {
       return;
     }
 
+    // 不管成功或失敗都要跳到「路線結果」頁，讓使用者看到結果或失敗原因，
+    // 而不是只跳一個 toast、畫面停在「規劃路線」看起來像沒反應
+    const showFailure = (title, message, routes = []) => {
+      setRouteResult(null);
+      setPlanFailure({ title, message, routes });
+      setPanelStep(RESULT_STEP);
+    };
+
     setIsPlanning(true);
+    setPlanFailure(null);
     try {
       const payload = buildPayload();
 
@@ -431,37 +444,12 @@ export default function MapPage() {
         }
 
         setBugPrefill(`HTTP ${response.status}：${errMsg}`);
+        showFailure(`路線規劃失敗（HTTP ${response.status}）`, errMsg);
         return;
       }
 
-      let raw = await response.json();
+      const raw = await response.json();
 
-      // 路邊停車找不到路線時（通常是附近路邊幾乎全滿，繞圈找空格會超過繞路上限），
-      // 自動改用 parkingType: 'both' 再問一次，讓演算法連停車場一起考慮，
-      // 免得使用者一直卡在「找不到路線」又不知道要改什麼
-      const isUsable = (data) => data?.status === 'success' && data.routes?.some((r) => r.available && r.routeGeometry?.length);
-      if (payload.parkingType === 'roadside' && !isUsable(raw)) {
-        try {
-          const fallbackRes = await fetch('/api/plan-route', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ...payload, parkingType: 'both' }),
-          });
-          if (fallbackRes.ok) {
-            const fallbackRaw = await fallbackRes.json();
-            if (isUsable(fallbackRaw)) {
-              raw = fallbackRaw;
-              addToast(
-                'info',
-                '附近路邊車位已滿',
-                '附近找不到路邊空位，已改為同時考慮停車場'
-              );
-            }
-          }
-        } catch (_) {
-          // 備案失敗就維持原本的結果，交給下面顯示「找不到路線」
-        }
-      }
 
       // 後端有時候會用 HTTP 200 + status 欄位來表示「沒有結果」，
       // 不是靠 HTTP 錯誤碼，所以這裡要另外檢查 body 裡的 status。
@@ -470,12 +458,14 @@ export default function MapPage() {
       // 而且有路線幾何資料的路線
       const hasUsableRoute = raw.routes?.some((r) => r.available && r.routeGeometry?.length);
       if (raw.status !== 'success' || !hasUsableRoute) {
-        addToast(
-          'warning',
+        // 後端可能回 no_route（附每種方式各自失敗的原因）、no_parking 或 error（沒有 routes）
+        showFailure(
           '找不到符合條件的路線',
-          raw.message || '目前沒有符合條件的可用車位，請嘗試放寬條件或更換起訖點'
+          raw.message || '目前沒有符合條件的可用車位，請嘗試放寬條件或更換起訖點',
+          (raw.routes || [])
+            .filter((r) => !r.available)
+            .map((r) => ({ mode_name: r.mode_name || r.mode, message: r.message }))
         );
-        setRouteResult(null);
         return;
       }
 
@@ -499,6 +489,12 @@ export default function MapPage() {
         addToast('error', '規劃路線時發生錯誤', err.message || '未知錯誤');
       }
       setBugPrefill(err?.message || '未知前端錯誤');
+      showFailure(
+        '規劃路線時發生錯誤',
+        err instanceof TypeError && err.message.includes('fetch')
+          ? '無法連線至伺服器，請確認網路連線後再試'
+          : err?.message || '未知錯誤'
+      );
     } finally {
       setIsPlanning(false);
     }
@@ -1218,6 +1214,32 @@ export default function MapPage() {
                   : '用 Google Maps 導航'}
               </SecondaryButton>
             </>
+          ) : planFailure ? (
+            <div
+              style={{
+                padding: '12px 14px',
+                border: '1px solid #16254F',
+                borderRadius: 8,
+                background: 'rgba(102, 125, 157, 0.12)',
+              }}
+            >
+              <div style={{ fontSize: 14, fontWeight: 700, color: '#ECECEC', marginBottom: 6 }}>
+                {planFailure.title}
+              </div>
+              <div style={{ fontSize: 12, color: '#ACBBC6', lineHeight: 1.6 }}>{planFailure.message}</div>
+              {planFailure.routes.length > 0 && (
+                <ul style={{ margin: '10px 0 0', paddingLeft: 18, fontSize: 12, color: '#ACBBC6', lineHeight: 1.7 }}>
+                  {planFailure.routes.map((r, i) => (
+                    <li key={i}>
+                      {r.mode_name}：{r.message || '找不到可行路線'}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <div style={{ fontSize: 11, color: STEP_COLORS.muted, marginTop: 10, lineHeight: 1.5 }}>
+                可以回上一步放寬條件（例如加大最遠距離、改選停車場或加選接駁方式）後再試一次。
+              </div>
+            </div>
           ) : (
             <div style={{ fontSize: 12, color: STEP_COLORS.muted, textAlign: 'center', padding: '16px 0' }}>
               還沒有路線結果，請回上一步按「開始規劃路線」。
