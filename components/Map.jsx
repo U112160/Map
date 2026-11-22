@@ -144,7 +144,6 @@ export default function Map({
   mrtExits = [],
   start,
   end,
-  priorityMode,
   routes = [],
   selectedRouteIndex = 0,
   lotSearch = null,   // { center: {lat,lng}, radius(公尺) }：選擇停車場時的搜尋範圍

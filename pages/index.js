@@ -1,14 +1,13 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import dynamic from 'next/dynamic';
 
-import { toCoords, splitRouteIntoLegs, transportModesToString, normalizeRouteResult, buildGoogleMapsUrl } from '../lib/routeUtils';
+import { toCoords, splitRouteIntoLegs, splitStopsIntoLegs, buildDriveNavigationStops, withGoogleStartLeg, transportModesToString, normalizeRouteResult, buildGoogleMapsUrl } from '../lib/routeUtils';
 import { getRouteColor } from '../lib/routeColors';
 import { formatCarAvailability } from '../lib/parkingFormat';
 import { useToast } from '../hooks/useToast';
 import { SearchInput } from '../components/ui/SearchInput';
 import { PreferenceToggle } from '../components/ui/PreferenceToggle';
 import { CheckboxGroup } from '../components/ui/CheckboxGroup';
-import { PriceLimitInput } from '../components/ui/PriceLimitInput';
 import { DistanceLimitInput } from '../components/ui/DistanceLimitInput';
 import { PrimaryButton, SecondaryButton } from '../components/ui/Buttons';
 import { RouteSummary } from '../components/ui/RouteSummary';
@@ -57,6 +56,10 @@ function haversineMeters(a, b) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
+// maxRate（每小時費率上限）：前端已拿掉「費率優先／每小時費率上限」的選項，固定送 500。
+// 放在元件外面，render 時的步驟檢查（getStepBlocker）也能安全使用
+const MAX_RATE = 500;
+
 export default function MapPage() {
   const [data, setData] = useState([]);
   const [roadsideSpots, setRoadsideSpots] = useState([]);
@@ -65,17 +68,12 @@ export default function MapPage() {
   // 到達目的地的方式（複選）：停車後如果離目的地還有一段距離，讓使用者勾選願意搭配的接駁方式
   // 陣列可以是空的（代表只走路）、選一個、或同時選兩個（代表 YouBike、捷運都可接受）
   const [transportModes, setTransportModes] = useState([]);
-  // 可接受的最遠距離（公尺）：跟 maxPrice 同一種「使用者自訂上限」的做法
+  // 可接受的最遠距離（公尺）：使用者自訂的上限
   const [maxDistance, setMaxDistance] = useState('500');
-  // 停車順序，對應演算法 /calculate 的 parkFirst 欄位：
-  // false = 先開到終點放人，再自己去找車位；true = 先去停車，再走／接駁到終點
-  const [parkFirst, setParkFirst] = useState(false);
   // 接駁距離（公尺）：放在「接駁方式」那一步，捷運、YouBike 各自一個，
   // 預設 500、每格 100，只有勾選該接駁方式時才會顯示、才會送給後端
   const [mrtDistance, setMrtDistance] = useState('500');
   const [ubikeDistance, setUbikeDistance] = useState('500');
-  const [priorityMode, setPriorityMode] = useState('space');
-  const [maxPrice, setMaxPrice] = useState('');
   // 停車類型：'roadside' = 路邊停車格（演算法自己挑，跟以前一樣）；
   // 'lot' = 停車場（使用者自己從範圍內的停車場挑一座，把停車場 id 送給後端）
   const [parkingType, setParkingType] = useState('roadside');
@@ -278,7 +276,6 @@ export default function MapPage() {
     }
     if (step === 'condition') {
       if (!(Number(maxDistance) > 0)) return '請填入可接受的最遠距離';
-      if (priorityMode === 'rate' && !(Number(maxPrice) > 0)) return '費率上限必須大於 0';
     }
     if (step === 'lot') {
       if (lotsLoading) return '停車場載入中…';
@@ -312,8 +309,6 @@ export default function MapPage() {
     ['終點', end?.name || '—'],
     ['最遠距離', `${maxDistance || 0} 公尺`],
     ['停車類型', parkingType === 'lot' ? '停車場' : '路邊停車格'],
-    ['停車順序', parkFirst ? '先停車再前往終點' : '先到終點放人再停車'],
-    ['優先條件', priorityMode === 'rate' ? `費率優先（≤ $${maxPrice}/時）` : '車位優先'],
     ...(parkingType === 'lot' ? [['指定停車場', selectedLot?.name || '—']] : []),
     ['接駁方式', transportModes.length ? transportModes.map((m) => TRANSPORT_LABELS[m] || m).join('、') : '走路'],
     ...(transportModes.includes('mrt') ? [['捷運接駁距離', `${mrtDistance || 0} 公尺`]] : []),
@@ -327,23 +322,6 @@ export default function MapPage() {
     );
   };
 
-  const handlePriorityModeChange = (mode) => {
-    setPriorityMode(mode);
-    if (mode !== 'rate') {
-      setMaxPrice('');
-    } else if (!maxPrice) {
-      setMaxPrice('30'); // 切到費率優先時，若還沒填過，預設帶入 30
-    }
-  };
-
-  // 後端不管在哪種 priorityMode 下都會把 maxRate 當成硬性的價格上限來篩選，
-  // 不是只有「費率優先」才生效。所以「空間優先」「距離優先」這兩種模式，
-  // 如果照舊送 maxRate: 0，等於跟後端說「只接受免費車位」，
-  // 導致大多數地點都篩選到 0 筆、回傳 no_parking（一直沒有真正回傳過真的資料的原因）。
-  // 只有在「費率優先」時才把使用者填的上限帶進去，其他模式一律送一個
-  // 大到不會篩掉任何車位的數字，等於「不限制費率」。
-  const NO_RATE_LIMIT = 99999;
-
   // 切換停車類型：舊的路線結果是用另一種類型算的，直接清掉避免誤會
   const handleParkingTypeChange = (type) => {
     if (type === parkingType) return;
@@ -356,10 +334,12 @@ export default function MapPage() {
   function buildPayload() {
     const isLot = parkingType === 'lot';
     const payload = {
-      priorityMode,
+      // 「費率優先／車位優先」選項已拿掉，固定用車位優先；
+      // 後端一定會拿 maxRate 當價格上限篩選（送 0 會變成只找免費車位），所以固定送 MAX_RATE
+      priorityMode: 'space',
       start: toCoords(start),
       end: toCoords(end),
-      maxRate: priorityMode === 'rate' ? (Number(maxPrice) || 0) : NO_RATE_LIMIT,
+      maxRate: MAX_RATE,
       transportMode: transportModesToString(transportModes),
       maxDistance: Number(maxDistance) || 0,
     };
@@ -373,7 +353,6 @@ export default function MapPage() {
     // parkingType 選路邊停車格時是 'roadside'，其他欄位跟以前完全一樣
     payload.parkingType = isLot ? 'lot' : 'roadside';
     if (isLot) payload.parkingLotId = selectedLotId;
-    payload.parkFirst = parkFirst;
     return payload;
   }
 
@@ -398,14 +377,6 @@ export default function MapPage() {
       addToast('warning', '尚未選擇停車場', '請先回到「選擇停車場」步驟挑一座停車場');
       return;
     }
-    if (priorityMode === 'rate' && !maxPrice) {
-      addToast('warning', '請輸入費率上限', '已選擇「費率優先」，請填入每小時可接受的最高費率');
-      return;
-    }
-    if (priorityMode === 'rate' && Number(maxPrice) <= 0) {
-      addToast('warning', '費率上限無效', '費率上限必須大於 0');
-      return;
-    }
 
     // 不管成功或失敗都要跳到「路線結果」頁，讓使用者看到結果或失敗原因，
     // 而不是只跳一個 toast、畫面停在「規劃路線」看起來像沒反應
@@ -419,6 +390,8 @@ export default function MapPage() {
     setPlanFailure(null);
     try {
       const payload = buildPayload();
+      // 開發用：在瀏覽器 F12 → Console 看這次實際送給 /api/plan-route 的資料
+      console.log('[plan-route] 送出的資料：', payload);
 
       const response = await fetch('/api/plan-route', {
         method: 'POST',
@@ -500,14 +473,69 @@ export default function MapPage() {
     }
   }
 
+  // ── 開車路線「起點 → 終點」改畫 Google Maps 推薦的路線 ──
+  // 起點到終點導航時是交給 Google 自己算的（見 buildDriveNavigationStops），
+  // 地圖上也畫 Google 的路線，跟實際導航一致；終點之後到停車位才是演算法的路線。
+  // googleStartLeg = { key: 這次的起訖點, path: [{lat,lng}...] }；拿不到（沒金鑰、Google 出錯）就是 null，
+  // 地圖會退回只畫演算法的整條路線。
+  const [googleStartLeg, setGoogleStartLeg] = useState(null);
+  useEffect(() => {
+    const driveRoute = routeResult?.routes?.find((r) => r.mode === 'drive' && r.available);
+    const waypoints = driveRoute?.waypoints || [];
+    const destWp = waypoints.find((w) => w.type === 'destination');
+    if (!driveRoute || !waypoints[0] || !destWp) {
+      setGoogleStartLeg(null);
+      return;
+    }
+    const origin = { lat: waypoints[0].lat, lng: waypoints[0].lng };
+    const destination = { lat: destWp.lat, lng: destWp.lng };
+    const key = `${origin.lat},${origin.lng}->${destination.lat},${destination.lng}`;
+
+    let cancelled = false; // 路線又換了的話，舊的回應不要蓋掉新的
+    fetch('/api/google-route', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ origin, destination }),
+    })
+      .then(async (res) => {
+        const json = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (res.ok && json.path?.length) {
+          setGoogleStartLeg({ key, path: json.path });
+        } else {
+          console.warn('[google-route] 取不到 Google 路線，改畫演算法的整條路線：', json.error || res.status);
+          setGoogleStartLeg(null);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          console.warn('[google-route] 呼叫失敗，改畫演算法的整條路線：', err);
+          setGoogleStartLeg(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [routeResult]);
+
+  // 實際畫在地圖上的路線：開車路線的前半段換成 Google 的路線，其他路線不變
+  const mapRoutes = useMemo(
+    () => (routeResult?.routes || []).map((r) => (r.mode === 'drive' ? withGoogleStartLeg(r, googleStartLeg?.path) : r)),
+    [routeResult, googleStartLeg]
+  );
+
   // routeResult 現在是整包多路線回應，畫在地圖上／拿來切 Google Maps 路段的
   // 是使用者目前選的那一條（selectedRouteIndex），不是整包本身
   const activeRoute = routeResult?.routes?.[selectedRouteIndex] ?? null;
 
   // 把目前選中的路線切成多段（每段都在 Google Maps 的 10 站上限內）
   // 只有在真的超過上限時才會超過 1 段，一般情況下 googleMapsLegs.length === 1
+  // 開車路線：起點→終點交給 Google 自己算，終點→停車位才用演算法的轉彎點（見 buildDriveNavigationStops）；
+  // 其他路線（捷運／YouBike 轉乘）維持舊做法：整條路線取轉彎點
   const googleMapsLegs = useMemo(() => {
     if (!activeRoute?.routeGeometry) return [];
+    const driveStops = buildDriveNavigationStops(activeRoute);
+    if (driveStops) return splitStopsIntoLegs(driveStops, 10);
     return splitRouteIntoLegs(activeRoute.routeGeometry, 10);
   }, [activeRoute]);
 
@@ -927,34 +955,6 @@ export default function MapPage() {
             value={maxDistance}
             onChange={setMaxDistance}
           />
-
-          <PreferenceToggle
-            label="先停車還是先放人"
-            value={parkFirst}
-            onChange={setParkFirst}
-            options={[
-              { value: false, label: '先到終點放人' },
-              { value: true, label: '先停車再過去' },
-            ]}
-          />
-
-          <PreferenceToggle
-            label="費率優先還是車位優先"
-            value={priorityMode}
-            onChange={handlePriorityModeChange}
-            options={[
-              { value: 'space', label: '車位優先' },
-              { value: 'rate', label: '費率優先' },
-            ]}
-          />
-
-          {priorityMode === 'rate' && (
-            <PriceLimitInput
-              label="每小時費率上限"
-              value={maxPrice}
-              onChange={setMaxPrice}
-            />
-          )}
         </div>
 
         {/* ── 第 3 步：接駁方式 ── */}
@@ -1365,8 +1365,7 @@ export default function MapPage() {
         mrtExits={mrtExits}
         start={start}
         end={end}
-        priorityMode={priorityMode}
-        routes={routeResult?.routes || []}
+        routes={mapRoutes}
         selectedRouteIndex={selectedRouteIndex}
         /* 選擇停車場那一步時，地圖畫出搜尋範圍圓圈；選好的停車場一直用醒目圖示標出 */
         lotSearch={

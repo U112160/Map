@@ -1,4 +1,4 @@
-export function PriceLimitInput({ label, value, onChange }) {
+export function PriceLimitInput({ label, value, onChange, max }) {
   return (
     <div style={{ marginBottom: 14 }}>
       <div style={{ fontSize: 13, fontWeight: 600, color: '#ECECEC', marginBottom: 6 }}>
@@ -8,6 +8,7 @@ export function PriceLimitInput({ label, value, onChange }) {
         <input
           type="number"
           min="0"
+          max={max}
           step="10"
           value={value}
           onChange={(e) => onChange(e.target.value)}
