@@ -70,8 +70,8 @@ export default function MapPage() {
   const [transportModes, setTransportModes] = useState([]);
   // 可接受的最遠距離（公尺）：使用者自訂的上限
   const [maxDistance, setMaxDistance] = useState('500');
-  // 找路邊車位用的演算法，對應演算法 /calculate 的 parkingAlgo 欄位（'greedy' | 'ring'，後端預設 greedy）。
-  // 只有路邊停車格需要「找」車位；停車場是使用者自己指定的，所以只在選路邊時顯示、送出
+  // 找車位用的演算法，對應演算法 /calculate 的 parkingAlgo 欄位（'greedy' | 'ring'，後端預設 greedy）。
+  // 路邊停車格、停車場都可以選，一律送出
   const [parkingAlgo, setParkingAlgo] = useState('greedy');
   // 接駁距離（公尺）：放在「接駁方式」那一步，捷運、YouBike 各自一個，
   // 預設 500、每格 100，只有勾選該接駁方式時才會顯示、才會送給後端
@@ -312,7 +312,7 @@ export default function MapPage() {
     ['終點', end?.name || '—'],
     ['最遠距離', `${maxDistance || 0} 公尺`],
     ['停車類型', parkingType === 'lot' ? '停車場' : '路邊停車格'],
-    ...(parkingType === 'roadside' ? [['找車位演算法', parkingAlgo === 'ring' ? 'Ring' : 'Greedy']] : []),
+    ['找車位演算法', parkingAlgo === 'ring' ? 'Ring' : 'Greedy'],
     ...(parkingType === 'lot' ? [['指定停車場', selectedLot?.name || '—']] : []),
     ['接駁方式', transportModes.length ? transportModes.map((m) => TRANSPORT_LABELS[m] || m).join('、') : '走路'],
     ...(transportModes.includes('mrt') ? [['捷運接駁距離', `${mrtDistance || 0} 公尺`]] : []),
@@ -356,7 +356,7 @@ export default function MapPage() {
     // ⚠️ 欄位名稱 parkingType / parkingLotId 也是我們前端先定的，要跟隊友確認；
     // parkingType 選路邊停車格時是 'roadside'，其他欄位跟以前完全一樣
     payload.parkingType = isLot ? 'lot' : 'roadside';
-    if (!isLot) payload.parkingAlgo = parkingAlgo;
+    payload.parkingAlgo = parkingAlgo;
     if (isLot) payload.parkingLotId = selectedLotId;
     return payload;
   }
@@ -964,17 +964,15 @@ export default function MapPage() {
             onChange={setMaxDistance}
           />
 
-          {parkingType === 'roadside' && (
-            <PreferenceToggle
-              label="找車位演算法"
-              value={parkingAlgo}
-              onChange={setParkingAlgo}
-              options={[
-                { value: 'greedy', label: 'Greedy' },
-                { value: 'ring', label: 'Ring' },
-              ]}
-            />
-          )}
+          <PreferenceToggle
+            label="找車位演算法"
+            value={parkingAlgo}
+            onChange={setParkingAlgo}
+            options={[
+              { value: 'greedy', label: 'Greedy' },
+              { value: 'ring', label: 'Ring' },
+            ]}
+          />
         </div>
 
         {/* ── 第 3 步：接駁方式 ── */}
