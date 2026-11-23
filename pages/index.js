@@ -161,8 +161,7 @@ export default function MapPage() {
 
   // ── 選單面板改成分步驟填寫，避免一次塞太多欄位 ──
   // 起訖點 → 停車條件 → 接駁方式 →（選停車場時才有：選擇停車場）→ 規劃路線 → 路線結果
-  // 「選擇停車場」要放在接駁方式後面：停車場的搜尋範圍是由接駁距離算出來的，
-  // 使用者填完接駁距離才算得出範圍。每一步用 id 判斷，不用數字索引，
+  // 「選擇停車場」的搜尋範圍是第 2 步「可接受的最遠距離」。每一步用 id 判斷，不用數字索引，
   // 這樣有沒有多一步都不會錯位
   const stepDefs =
     parkingType === 'lot'
@@ -186,15 +185,10 @@ export default function MapPage() {
   const [panelStep, setPanelStep] = useState(0);
   const stepId = stepDefs[Math.min(panelStep, RESULT_STEP)].id;
 
-  // 停車場的搜尋範圍（公尺）：以終點為圓心。
-  // 有勾捷運／YouBike 就取勾選的接駁距離中最大的那個；都沒勾（走路）就用「可接受的最遠距離」。
-  // ⚠️ 範圍怎麼定義是我的假設，要跟隊友確認；要改只需要改這裡
-  const lotRadiusMeters = useMemo(() => {
-    const picked = [];
-    if (transportModes.includes('mrt')) picked.push(Number(mrtDistance) || 0);
-    if (transportModes.includes('ubike')) picked.push(Number(ubikeDistance) || 0);
-    return picked.length ? Math.max(...picked) : Number(maxDistance) || 0;
-  }, [transportModes, mrtDistance, ubikeDistance, maxDistance]);
+  // 停車場的搜尋範圍（公尺）：以終點為圓心，半徑 = 第 2 步「可接受的最遠距離」。
+  // 跟演算法一致：開車直達時演算法也是用 maxDistance 當終點附近找車位的半徑，
+  // 所以列出來的停車場就是演算法會考慮的範圍；使用者改距離，範圍就跟著變
+  const lotRadiusMeters = Number(maxDistance) || 0;
 
   const selectedLot = lotCandidates.find((l) => l.pkid === selectedLotId) ?? null;
 
@@ -282,7 +276,7 @@ export default function MapPage() {
     }
     if (step === 'lot') {
       if (lotsLoading) return '停車場載入中…';
-      if (!selectedLotId) return lotCandidates.length ? '請選擇一座停車場' : '範圍內沒有停車場，請回上一步調高接駁距離';
+      if (!selectedLotId) return lotCandidates.length ? '請選擇一座停車場' : '範圍內沒有停車場，請回「停車條件」調高可接受的最遠距離';
     }
     if (step === 'transfer') {
       // 哪個接駁方式有勾，對應的接駁距離才有意義，才要求要填；
@@ -1025,7 +1019,7 @@ export default function MapPage() {
             )}
             {!lotsLoading && !lotsError && lotCandidates.length === 0 && (
               <div style={{ fontSize: 12, color: STEP_COLORS.muted, padding: '12px 0', textAlign: 'center' }}>
-                範圍內沒有停車場，請回上一步調高接駁距離。
+                範圍內沒有停車場，請回「停車條件」調高可接受的最遠距離。
               </div>
             )}
 
