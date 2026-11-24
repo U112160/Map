@@ -1,4 +1,4 @@
-import { MapContainer, TileLayer, Marker, Popup, Polyline, Circle, useMap, useMapEvents } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Polyline, Circle, Pane, useMap, useMapEvents } from 'react-leaflet';
 import { getRouteColor } from '../lib/routeColors';
 import { formatCarAvailability } from '../lib/parkingFormat';
 import 'leaflet/dist/leaflet.css';
@@ -30,6 +30,30 @@ function makeCircleIcon(iconUrl, size = 24, padding = 4, shadow = true, ringColo
     popupAnchor: [0, -total],
   });
 }
+
+// ── 白色橫向橢圓文字標籤（捷運上下車站、YouBike 借還車站）────────────
+// 以座標為中心顯示，不是 pin 造型；iconSize 設 0、內容自己用 translate 置中
+function makePillLabelIcon(text) {
+  return divIcon({
+    html: `<div style="
+      position:absolute;left:0;top:0;transform:translate(-50%,-50%);
+      padding:4px 14px;border-radius:999px;
+      background:#fff;color:#1B2A4A;
+      font-size:14px;font-weight:800;line-height:1.3;letter-spacing:1px;
+      white-space:nowrap;
+      box-shadow:0 2px 6px rgba(0,0,0,0.3);
+    ">${text}</div>`,
+    className: '',
+    iconSize: [0, 0],
+    iconAnchor: [0, 0],
+    popupAnchor: [0, -14],
+  });
+}
+
+const TRANSIT_LABELS = {
+  ubike: ['借車站', '還車站'],
+  mrt: ['上車站', '下車站'],
+};
 
 // ── 依狀態上色的圓框圖示工廠（路邊停車格用）─────────────────────────
 // 跟 makeCircleIcon 一樣，只是背景色可以指定（不是固定白色）
@@ -158,7 +182,6 @@ export default function Map({
   const customIcon            = useMemo(() => makeCircleIcon('/parking.png',                  20, 4), []);
   const ubikeIcon             = useMemo(() => makeCircleIcon('/bicycle.png',                  18, 4), []);
   const mrtExitIcon           = useMemo(() => makeCircleIcon('/MRT.png',                      18, 4), []);
-  const recommendedParkingIcon= useMemo(() => makeCircleIcon('/parking-recommended.png',      22, 5), []);
   // 使用者選定的停車場：一般停車場圖示 + 外圍一圈顏色（要換色改最後一個參數）
   const selectedLotIcon       = useMemo(() => makeCircleIcon('/parking.png',                  22, 5, true, '#1f5dcf'), []);
 
@@ -214,55 +237,65 @@ export default function Map({
   }), []);
 
   // ── 路線座標轉換 ───────────────────────────────────────────────────
-  // 後端一次回傳多條路線（開車／捷運／YouBike），每條各畫一條線、顏色不同。
-  // 這幾條路線通常有一大段是同一條路（都是先開車從起點出發），如果線一樣粗，
-  // 畫在最上面的那條會把底下的完全蓋住，看起來像只有一條線。
-  // 目前選中的那條一律排到最上面、畫最粗、不透明，一眼就看得出是哪條；
-  // 其他沒選中的照原順序墊在底下、比較細、稍淡，彼此之間越下面越粗一點，
-  // 沒選中的線疊在一起時每種顏色仍會露出邊（像套圈）。
-  // 以前順序固定照陣列，「純開車直達」永遠是第一條 → 永遠在最底層，選了也浮不上來。
+  // 後端一次回傳多條路線（開車／捷運／YouBike／合成），每條各畫一條線、顏色不同。
+  // 只畫開車段（segments 裡 mode = drive）；捷運、YouBike 那段不畫線，
+  // 改在上下車站各放一個白色橢圓標籤（見下面的 transitLabels）。
+  //
+  // 疊放與透明度：
+  //   - 選中的那條放在最上層的 pane、比較粗；
+  //   - 沒選中的放在下層 pane、比較細，合成路線（紫色）再淡一點。
+  //   - 透明度設在 pane（整層）上、線本身不透明：同一層裡重疊的線，上面那條會完全蓋住下面那條，
+  //     顏色不會互相疊加、也不會從邊緣露出別條線的顏色（以前看起來像紅色細外框的就是這個）。
+  //     合成路線自己會重複經過同一段路，也不會因此疊出更深的顏色。
   const routeLines = useMemo(() => {
     const usable = routes
       .map((route, index) => ({ route, index }))
-      .filter(({ route }) => route?.available && route.routeGeometry?.length);
+      .filter(({ route }) => route?.available && (route.segments?.length || route.routeGeometry?.length));
     // 選中的那條移到陣列最後 = 最後掛上去 = 疊在最上面
     const ordered = [
       ...usable.filter(({ index }) => index !== selectedRouteIndex),
       ...usable.filter(({ index }) => index === selectedRouteIndex),
     ];
     // Leaflet 的線疊放順序是「誰先掛上去誰在下面」，React 不會幫忙重排。
-    // 把「排列後的順序」放進 key，換選一條路線或路線組合改變時就整批重新掛上，
-    // 疊放順序才會跟 ordered 一致（只有幾條線，重新掛上的成本可以忽略）。
+    // 把「排列後的順序」放進 key，換選一條路線或路線組合改變時就整批重新掛上。
     const orderKey = ordered.map(({ route, index }) => route.mode || index).join('-');
-    // 沒選中的：最上面那條 4px，往下每層 +2px；選中的：比最粗的沒選中路線再粗 3px
-    const unselectedCount = ordered.filter(({ index }) => index !== selectedRouteIndex).length;
-    const maxUnselectedWeight = 4 + 2 * Math.max(0, unselectedCount - 1);
-    return ordered.map(({ route, index }, order) => {
+    return ordered.flatMap(({ route, index }, order) => {
       const selected = index === selectedRouteIndex;
-      return {
-        key: `route-${orderKey}-${order}`,
+      const pane = selected ? 'route-selected' : route.mode === 'combined' ? 'route-dim-combined' : 'route-dim';
+      const segments = route.segments?.length
+        ? route.segments.filter((s) => s.mode === 'drive' && s.coords?.length >= 2)
+        : [{ mode: 'drive', coords: route.routeGeometry }];
+      return segments.map((seg, si) => ({
+        key: `route-${orderKey}-${order}-${si}`,
         color: getRouteColor(route, index),
-        selected,
-        weight: selected ? maxUnselectedWeight + 3 : 4 + 2 * (unselectedCount - 1 - order),
-        positions: route.routeGeometry.map((p) => [p.lat, p.lng]),
-      };
+        weight: selected ? 8 : 5,
+        pane,
+        positions: seg.coords.map((p) => [p.lat, p.lng]),
+      }));
     });
   }, [routes, selectedRouteIndex]);
 
-  // 各條路線推薦的停車場，用 id 去重（不同路線可能推薦到同一座）
-  const recommendedParkings = useMemo(() => {
+  // 選中路線的捷運／YouBike 上下車站標籤（合成路線會同時有兩種）
+  const transitLabels = useMemo(() => {
+    const route = routes[selectedRouteIndex];
+    if (!route?.available) return [];
     const seen = new Set();
     const list = [];
-    routes.forEach((route) => {
-      if (!route?.available) return;
-      (route.alongRouteParkings || []).forEach((spot) => {
-        if (seen.has(spot.id)) return;
-        seen.add(spot.id);
-        list.push(spot);
+    (route.segments || []).forEach((seg) => {
+      const names = TRANSIT_LABELS[seg.mode];
+      if (!names) return;
+      const coords = seg.coords || [];
+      const ends = [seg.from || coords[0], seg.to || coords[coords.length - 1]];
+      ends.forEach((pt, i) => {
+        if (!pt || !Number.isFinite(pt.lat) || !Number.isFinite(pt.lng)) return;
+        const id = `${seg.mode}-${i}-${pt.lat},${pt.lng}`;
+        if (seen.has(id)) return;
+        seen.add(id);
+        list.push({ id, lat: pt.lat, lng: pt.lng, label: names[i], name: pt.name });
       });
     });
     return list;
-  }, [routes]);
+  }, [routes, selectedRouteIndex]);
 
   return (
     <MapContainer 
@@ -397,19 +430,30 @@ export default function Map({
       )}
 
       {/* ── 路線 ── */}
+      {/* 三層 pane：透明度設在整層上（見 routeLines 的說明），zIndex 介於底圖（200）與標記（600）之間 */}
+      <Pane name="route-dim-combined" style={{ zIndex: 401, opacity: 0.25 }} />
+      <Pane name="route-dim" style={{ zIndex: 402, opacity: 0.5 }} />
+      <Pane name="route-selected" style={{ zIndex: 403, opacity: 0.85 }} />
       {routeLines.map((line) => (
         <Polyline
           key={line.key}
           positions={line.positions}
+          pane={line.pane}
           pathOptions={{
             color: line.color,
             weight: line.weight,
-            // 選中的線已經靠「最粗、最上層」凸顯，不需要全不透明；
-            // 全不透明時粗線顏色太飽和、太搶眼，稍微降一點讓底圖透出來比較柔和。
-            // 沒選中的再淡一點，維持兩者的層次差
-            opacity: line.selected ? 0.8 : 0.5,
+            opacity: 1,
+            lineCap: 'round',
+            lineJoin: 'round',
           }}
         />
+      ))}
+
+      {/* ── 捷運上下車站／YouBike 借還車站標籤（只顯示選中的路線）── */}
+      {transitLabels.map((t) => (
+        <Marker key={t.id} position={[t.lat, t.lng]} icon={makePillLabelIcon(t.label)} zIndexOffset={800}>
+          {t.name && <Popup autoPan={false}>{t.label}：{t.name}</Popup>}
+        </Marker>
       ))}
 
       {/* ── 選擇停車場時的搜尋範圍圓圈 ── */}
@@ -437,22 +481,8 @@ export default function Map({
         </Marker>
       )}
 
-      {/* ── 演算法推薦停車格（不 cluster，保持突出顯示）── */}
-      {recommendedParkings.map((spot) => (
-        <Marker
-          key={`recommend-${spot.id}`}
-          position={[spot.lat, spot.lng]}
-          icon={recommendedParkingIcon}
-        >
-          <Popup autoPan={false}>
-            <b>🅿️ {spot.name}</b><br />
-            費率：{spot.fee} 元/小時<br />
-            車位類型：{spot.spaceType}<br />
-            {spot.hasCharging ? '⚡ 有充電樁　' : ''}
-            {spot.isAvailable ? '目前有空位' : '目前無空位'}
-          </Popup>
-        </Marker>
-      ))}
+      {/* 演算法的結果只用來畫路線（和捷運／YouBike 上下車標籤），
+          不另外疊停車格、停車場、YouBike、捷運圖示，地圖上這些都維持原本的即時資料與顏色 */}
 
       {/* ── 起終點（不 cluster）── */}
       {start && (

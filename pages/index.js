@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import dynamic from 'next/dynamic';
 
-import { toCoords, splitRouteIntoLegs, splitStopsIntoLegs, buildNavigationStops, withGoogleStartLeg, transportModesToString, normalizeRouteResult, buildGoogleMapsUrl } from '../lib/routeUtils';
+import { toCoords, splitRouteIntoLegs, splitStopsIntoLegs, buildNavigationStops, getGoogleLegRequests, withGoogleLegs, transportModesToString, normalizeRouteResult, buildGoogleMapsUrl } from '../lib/routeUtils';
 import { getRouteColor } from '../lib/routeColors';
 import { formatCarAvailability } from '../lib/parkingFormat';
 import { useToast } from '../hooks/useToast';
@@ -328,9 +328,7 @@ export default function MapPage() {
   function buildPayload() {
     const isLot = parkingType === 'lot';
     const payload = {
-      // 「費率優先／車位優先」選項已拿掉，固定用車位優先；
       // 後端一定會拿 maxRate 當價格上限篩選（送 0 會變成只找免費車位），所以固定送 MAX_RATE
-      priorityMode: 'space',
       start: toCoords(start),
       end: toCoords(end),
       maxRate: MAX_RATE,
@@ -467,67 +465,54 @@ export default function MapPage() {
     }
   }
 
-  // ── 每條路線的「起點 → 終點」改畫 Google Maps 推薦的路線 ──
-  // 起點到終點導航時是交給 Google 自己算的（見 buildNavigationStops），
-  // 地圖上也畫 Google 的路線，跟實際導航一致；終點之後才是演算法的路線。
-  // 純開車、捷運轉乘、YouBike 轉乘的起點和終點都一樣，所以只要向 Google 要一次。
-  // googleTrip：這次要向 Google 要路線的起訖點（從路線結果直接算出來，不另外存 state）；
-  // 沒有可用路線時是 null。
-  // googleStartLeg = { key: 對應的起訖點, path: [{lat,lng}...] }：Google 回來的路線。
-  // 只在 fetch 的回呼裡 setState（不在 effect 本體同步 setState，避免連鎖重新渲染）；
-  // 用 key 對上目前的 googleTrip 才使用，舊的、對不上的結果自然被忽略。
-  // 拿不到（沒金鑰、Google 出錯）時地圖會退回只畫演算法的整條路線。
-  const googleTrip = useMemo(() => {
-    // 任一條可用的路線都行（起訖點都一樣），優先用純開車那條
-    const usable = (routeResult?.routes || []).filter((r) => r.available);
-    const baseRoute = usable.find((r) => r.mode === 'drive') || usable[0];
-    const waypoints = baseRoute?.waypoints || [];
-    const destWp = waypoints.find((w) => w.type === 'destination');
-    if (!baseRoute || !waypoints[0] || !destWp) return null;
-    const origin = { lat: waypoints[0].lat, lng: waypoints[0].lng };
-    const destination = { lat: destWp.lat, lng: destWp.lng };
-    return { origin, destination, key: `${origin.lat},${origin.lng}->${destination.lat},${destination.lng}` };
+  // ── 每條路線的「起點 → 終點」改畫 Google Maps 推薦的路線（見 lib/routeUtils 的 getGoogleLegRequests）──
+  // googleLegRequests：這次所有路線（含合成路線）需要的「起點 → 放人點」，去重後的清單，
+  //   直接從路線結果算出來，不另外存 state。不同路線的放人點通常一樣，實際只會打一兩次。
+  // googlePaths = { [key]: [{lat,lng}...] }：Google 回來的路線，只在 fetch 的回呼裡 setState
+  //   （不在 effect 本體同步 setState，避免連鎖重新渲染）；key 對不上的舊結果自然用不到。
+  // 拿不到（沒金鑰、Google 出錯）的那段，地圖退回畫演算法原本的線。
+  const googleLegRequests = useMemo(() => {
+    const unique = new Map();
+    (routeResult?.routes || []).forEach((r) => {
+      getGoogleLegRequests(r).forEach((req) => {
+        if (!unique.has(req.key)) unique.set(req.key, { key: req.key, origin: req.origin, destination: req.destination });
+      });
+    });
+    return [...unique.values()];
   }, [routeResult]);
 
-  const [googleStartLeg, setGoogleStartLeg] = useState(null);
+  const [googlePaths, setGooglePaths] = useState({});
   useEffect(() => {
-    if (!googleTrip) return;
-    const { origin, destination, key } = googleTrip;
-
+    if (!googleLegRequests.length) return;
     let cancelled = false; // 路線又換了的話，舊的回應不要蓋掉新的
-    fetch('/api/google-route', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ origin, destination }),
-    })
-      .then(async (res) => {
-        const json = await res.json().catch(() => ({}));
-        if (cancelled) return;
-        if (res.ok && json.path?.length) {
-          setGoogleStartLeg({ key, path: json.path });
-        } else {
-          console.warn('[google-route] 取不到 Google 路線，改畫演算法的整條路線：', json.error || res.status);
-          setGoogleStartLeg(null);
-        }
+    googleLegRequests.forEach(({ key, origin, destination }) => {
+      fetch('/api/google-route', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ origin, destination }),
       })
-      .catch((err) => {
-        if (!cancelled) {
-          console.warn('[google-route] 呼叫失敗，改畫演算法的整條路線：', err);
-          setGoogleStartLeg(null);
-        }
-      });
+        .then(async (res) => {
+          const json = await res.json().catch(() => ({}));
+          if (cancelled) return;
+          if (res.ok && json.path?.length) {
+            setGooglePaths((prev) => ({ ...prev, [key]: json.path }));
+          } else {
+            console.warn('[google-route] 取不到 Google 路線，這段改畫演算法的線：', json.error || res.status);
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) console.warn('[google-route] 呼叫失敗，這段改畫演算法的線：', err);
+        });
+    });
     return () => {
       cancelled = true;
     };
-  }, [googleTrip]);
+  }, [googleLegRequests]);
 
-  // 只用「跟目前起訖點對得上」的 Google 路線
-  const googlePath = googleTrip && googleStartLeg?.key === googleTrip.key ? googleStartLeg.path : null;
-
-  // 實際畫在地圖上的路線：每條路線的前半段（起點 → 終點）都換成 Google 的路線
+  // 實際畫在地圖上的路線：每段「從起點出發」的開車段，起點 → 放人點都換成 Google 的路線
   const mapRoutes = useMemo(
-    () => (routeResult?.routes || []).map((r) => (r.available ? withGoogleStartLeg(r, googlePath) : r)),
-    [routeResult, googlePath]
+    () => (routeResult?.routes || []).map((r) => (r.available ? withGoogleLegs(r, googlePaths) : r)),
+    [routeResult, googlePaths]
   );
 
   // routeResult 現在是整包多路線回應，畫在地圖上／拿來切 Google Maps 路段的
