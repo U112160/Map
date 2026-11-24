@@ -70,9 +70,6 @@ export default function MapPage() {
   const [transportModes, setTransportModes] = useState([]);
   // 可接受的最遠距離（公尺）：使用者自訂的上限
   const [maxDistance, setMaxDistance] = useState('500');
-  // 找車位用的演算法，對應演算法 /calculate 的 parkingAlgo 欄位（'greedy' | 'ring'，後端預設 greedy）。
-  // 路邊停車格、停車場都可以選，一律送出
-  const [parkingAlgo, setParkingAlgo] = useState('greedy');
   // 接駁距離（公尺）：放在「接駁方式」那一步，捷運、YouBike 各自一個，
   // 預設 500、每格 100，只有勾選該接駁方式時才會顯示、才會送給後端
   const [mrtDistance, setMrtDistance] = useState('500');
@@ -306,7 +303,6 @@ export default function MapPage() {
     ['終點', end?.name || '—'],
     ['最遠距離', `${maxDistance || 0} 公尺`],
     ['停車類型', parkingType === 'lot' ? '停車場' : '路邊停車格'],
-    ['找車位演算法', parkingAlgo === 'ring' ? 'Ring' : 'Greedy'],
     ...(parkingType === 'lot' ? [['指定停車場', selectedLot?.name || '—']] : []),
     ['接駁方式', transportModes.length ? transportModes.map((m) => TRANSPORT_LABELS[m] || m).join('、') : '走路'],
     ...(transportModes.includes('mrt') ? [['捷運接駁距離', `${mrtDistance || 0} 公尺`]] : []),
@@ -350,7 +346,6 @@ export default function MapPage() {
     // ⚠️ 欄位名稱 parkingType / parkingLotId 也是我們前端先定的，要跟隊友確認；
     // parkingType 選路邊停車格時是 'roadside'，其他欄位跟以前完全一樣
     payload.parkingType = isLot ? 'lot' : 'roadside';
-    payload.parkingAlgo = parkingAlgo;
     if (isLot) payload.parkingLotId = selectedLotId;
     return payload;
   }
@@ -476,22 +471,28 @@ export default function MapPage() {
   // 起點到終點導航時是交給 Google 自己算的（見 buildNavigationStops），
   // 地圖上也畫 Google 的路線，跟實際導航一致；終點之後才是演算法的路線。
   // 純開車、捷運轉乘、YouBike 轉乘的起點和終點都一樣，所以只要向 Google 要一次。
-  // googleStartLeg = { key: 這次的起訖點, path: [{lat,lng}...] }；拿不到（沒金鑰、Google 出錯）就是 null，
-  // 地圖會退回只畫演算法的整條路線。
-  const [googleStartLeg, setGoogleStartLeg] = useState(null);
-  useEffect(() => {
+  // googleTrip：這次要向 Google 要路線的起訖點（從路線結果直接算出來，不另外存 state）；
+  // 沒有可用路線時是 null。
+  // googleStartLeg = { key: 對應的起訖點, path: [{lat,lng}...] }：Google 回來的路線。
+  // 只在 fetch 的回呼裡 setState（不在 effect 本體同步 setState，避免連鎖重新渲染）；
+  // 用 key 對上目前的 googleTrip 才使用，舊的、對不上的結果自然被忽略。
+  // 拿不到（沒金鑰、Google 出錯）時地圖會退回只畫演算法的整條路線。
+  const googleTrip = useMemo(() => {
     // 任一條可用的路線都行（起訖點都一樣），優先用純開車那條
     const usable = (routeResult?.routes || []).filter((r) => r.available);
     const baseRoute = usable.find((r) => r.mode === 'drive') || usable[0];
     const waypoints = baseRoute?.waypoints || [];
     const destWp = waypoints.find((w) => w.type === 'destination');
-    if (!baseRoute || !waypoints[0] || !destWp) {
-      setGoogleStartLeg(null);
-      return;
-    }
+    if (!baseRoute || !waypoints[0] || !destWp) return null;
     const origin = { lat: waypoints[0].lat, lng: waypoints[0].lng };
     const destination = { lat: destWp.lat, lng: destWp.lng };
-    const key = `${origin.lat},${origin.lng}->${destination.lat},${destination.lng}`;
+    return { origin, destination, key: `${origin.lat},${origin.lng}->${destination.lat},${destination.lng}` };
+  }, [routeResult]);
+
+  const [googleStartLeg, setGoogleStartLeg] = useState(null);
+  useEffect(() => {
+    if (!googleTrip) return;
+    const { origin, destination, key } = googleTrip;
 
     let cancelled = false; // 路線又換了的話，舊的回應不要蓋掉新的
     fetch('/api/google-route', {
@@ -518,12 +519,15 @@ export default function MapPage() {
     return () => {
       cancelled = true;
     };
-  }, [routeResult]);
+  }, [googleTrip]);
+
+  // 只用「跟目前起訖點對得上」的 Google 路線
+  const googlePath = googleTrip && googleStartLeg?.key === googleTrip.key ? googleStartLeg.path : null;
 
   // 實際畫在地圖上的路線：每條路線的前半段（起點 → 終點）都換成 Google 的路線
   const mapRoutes = useMemo(
-    () => (routeResult?.routes || []).map((r) => (r.available ? withGoogleStartLeg(r, googleStartLeg?.path) : r)),
-    [routeResult, googleStartLeg]
+    () => (routeResult?.routes || []).map((r) => (r.available ? withGoogleStartLeg(r, googlePath) : r)),
+    [routeResult, googlePath]
   );
 
   // routeResult 現在是整包多路線回應，畫在地圖上／拿來切 Google Maps 路段的
@@ -956,16 +960,6 @@ export default function MapPage() {
             label="可接受的最遠距離"
             value={maxDistance}
             onChange={setMaxDistance}
-          />
-
-          <PreferenceToggle
-            label="找車位演算法"
-            value={parkingAlgo}
-            onChange={setParkingAlgo}
-            options={[
-              { value: 'greedy', label: 'Greedy' },
-              { value: 'ring', label: 'Ring' },
-            ]}
           />
         </div>
 
