@@ -33,8 +33,13 @@ function makeCircleIcon(iconUrl, size = 24, padding = 4, shadow = true, ringColo
 
 // ── 白色橫向橢圓文字標籤（捷運上下車站、YouBike 借還車站）────────────
 // 以座標為中心顯示，不是 pin 造型；iconSize 設 0、內容自己用 translate 置中
+// 同樣文字的標籤共用同一個 icon 物件，地圖重新 render 時不必重建、重設每個標記的圖示。
+// 注意：這個檔案的元件叫 Map（export default function Map），直接寫 new Map() 會拿到元件本身，
+// 所以要用 globalThis.Map 取 JavaScript 內建的 Map
+const pillIconCache = new globalThis.Map();
 function makePillLabelIcon(text) {
-  return divIcon({
+  if (pillIconCache.has(text)) return pillIconCache.get(text);
+  const icon = divIcon({
     html: `<div style="
       position:absolute;left:0;top:0;transform:translate(-50%,-50%);
       padding:4px 14px;border-radius:999px;
@@ -48,7 +53,10 @@ function makePillLabelIcon(text) {
     iconAnchor: [0, 0],
     popupAnchor: [0, -14],
   });
+  pillIconCache.set(text, icon);
+  return icon;
 }
+
 
 const TRANSIT_LABELS = {
   ubike: ['借車站', '還車站'],
@@ -117,6 +125,18 @@ function formatApiTime(raw) {
   return isNaN(d.getTime()) ? null : d.toLocaleString('zh-TW');
 }
 
+// ── MarkerClusterGroup 共用設定（效能）────────────────────────────────
+// 地圖上同時有七八百個標記（停車場、YouBike、捷運出口、路邊停車格），
+// 每縮放一級四組 cluster 都要重新分群。實測主執行緒會卡 150～350ms，主要花在分群動畫：
+//   - animate: false        分群／拆群不做動畫（動畫期間每個標記都要逐格移動，最吃效能）
+//   - chunkedLoading        大量加入標記時分批做，不一次卡住畫面
+//   - removeOutsideVisibleBounds  畫面外的標記不放進 DOM（預設就是 true，寫出來避免被改掉）
+const CLUSTER_OPTIONS = {
+  chunkedLoading: true,
+  animate: false,
+  removeOutsideVisibleBounds: true,
+};
+
 // ── zoom 閾值：低於此數字就不顯示對應 marker ────────────────────────
 const ZOOM_SHOW_MRT      = 14;  // 捷運出口
 const ZOOM_SHOW_UBIKE    = 15;  // YouBike 站點
@@ -152,7 +172,7 @@ function MapEventHandler({ onMapMove, onZoomChange }) {
     moveend: (e) => {
       if (!onMapMove) return;
       const center = e.target.getCenter();
-      onMapMove({ lat: center.lat, lng: center.lng });
+      onMapMove({ lat: center.lat, lng: center.lng, zoom: e.target.getZoom() });
     },
     zoomend: (e) => {
       if (onZoomChange) onZoomChange(e.target.getZoom());
@@ -236,6 +256,122 @@ export default function Map({
     className: "custom-marker-icon", iconSize: point(33, 33, true),
   }), []);
 
+  // ── 地圖上的標記先用 useMemo 做好 ─────────────────────────────────
+  // 縮放時 zoom 這個 state 會變、整個 Map 會重新 render。如果標記直接寫在 JSX 裡，
+  // 每次 render 都會產生新的 position 陣列，react-leaflet 就會對「每一個」標記呼叫 setLatLng，
+  // 而 MarkerClusterGroup 收到 move 事件會把那個標記拿掉再加回去重算群組——
+  // 幾百個標記一起來，縮放就會卡。用 useMemo 包起來，只有資料或圖示真的變了才重建。
+  const lotMarkers = useMemo(
+    () =>
+      data.map((item, index) => (
+          // key 用停車場自己的 id，不用陣列索引：地圖移動重抓資料後，清單順序會變，
+          // 用索引當 key 的話，同一個 key 會對到別座停車場 → 每個標記都被搬家（拿掉再加回 cluster）
+          <Marker key={item.pkid ?? item.id ?? `${item.lat},${item.lng},${index}`} position={[item.lat, item.lng]} icon={customIcon}>
+            <Popup autoPan={false}>
+              <b>{item.name}</b><br />
+              {item.address}<br />
+              剩餘汽車位：{formatCarAvailability(item.available_count)}<br />
+              剩餘機車位：{item.available_motor}<br />
+              {item.payex && <><small>{item.payex}</small><br /></>}
+              {item.updatetime && (
+                <small style={{ color: '#888' }}>
+                  更新：{formatApiTime(item.updatetime)}
+                </small>
+              )}
+              </Popup>
+            </Marker>
+        )),
+    [data, customIcon]
+  );
+
+  const mrtMarkers = useMemo(
+    () =>
+      mrtExits.map((exit) => (
+            <Marker
+              key={`mrt-${exit.station_id}-${exit.exit_id}`}
+              position={[exit.lat, exit.lon]}
+              icon={mrtExitIcon}
+            >
+              <Popup autoPan={false}>
+                <b>{exit.station_name_zh} {exit.exit_name_zh}</b><br />
+                {exit.location_description}<br />
+                {exit.has_stair ? '有樓梯　' : ''}
+                {exit.has_elevator ? '有電梯　' : ''}
+                {exit.escalator_count > 0 ? `手扶梯 ${exit.escalator_count} 座` : ''}
+              </Popup>
+            </Marker>
+          )),
+    [mrtExits, mrtExitIcon]
+  );
+
+  const ubikeMarkers = useMemo(
+    () =>
+      ubikeStations.map((station) => (
+            <Marker
+              key={`ubike-${station.station_uid}`}
+              position={[station.lat, station.lon]}
+              icon={ubikeIcon}
+            >
+              <Popup autoPan={false}>
+                <b>{station.name_zh}</b><br />
+                {station.address_zh}<br />
+                可借：{station.available_rent ?? '-'} 台
+                可還：{station.available_return ?? '-'} 格<br />
+                電動車：{station.electric_bikes ?? '-'} 台<br />
+                站點容量：{station.bikes_capacity}<br />
+                {station.update_time && (
+                  <small style={{ color: '#888' }}>
+                    更新：{formatApiTime(station.update_time)}
+                  </small>
+                )}
+              </Popup>
+            </Marker>
+          )),
+    [ubikeStations, ubikeIcon]
+  );
+
+  const roadsideMarkers = useMemo(
+    () =>
+      roadsideSpots
+            .filter((spot) => typeof spot.lat === 'number' && typeof spot.lng === 'number')
+            .map((spot) => {
+              const statusInfo = getRoadsideStatusInfo(spot.status);
+              const iconSet = roadsideIconByStatus[spot.status] ?? roadsideIconUnknown;
+              const icon = spot.has_charging ? iconSet.charging : iconSet.normal;
+              return (
+                <Marker
+                  key={`roadside-${spot.pkid}`}
+                  position={[spot.lat, spot.lng]}
+                  icon={icon}
+                >
+                  <Popup autoPan={false}>
+                    <b>路邊停車格 {spot.pkid}</b><br />
+                    {spot.segment_name_zh && <>路段：{spot.segment_name_zh}<br /></>}
+                    狀態：<span style={{ color: statusInfo.color, fontWeight: 'bold' }}>{statusInfo.label}</span><br />
+                    {spot.has_charging && <>⚡ 有充電樁<br /></>}
+                    {spot.feeSchedule && spot.feeSchedule.length > 0 && (
+                      <>
+                        收費：
+                        {spot.feeSchedule.map((f, i) => (
+                          <div key={i} style={{ marginLeft: 8 }}>
+                            {f.startTime}–{f.endTime}：${f.price}
+                            {f.rateName && <small style={{ color: '#888' }}>（{f.rateName}）</small>}
+                          </div>
+                        ))}
+                      </>
+                    )}
+                    {spot.distance_km != null && (
+                      <small style={{ color: '#888' }}>
+                        距離：{spot.distance_km.toFixed(2)} 公里
+                      </small>
+                    )}
+                  </Popup>
+                </Marker>
+              );
+            }),
+    [roadsideSpots, roadsideIconByStatus, roadsideIconUnknown]
+  );
+
   // ── 路線座標轉換 ───────────────────────────────────────────────────
   // 後端一次回傳多條路線（開車／捷運／YouBike／合成），每條各畫一條線、顏色不同。
   // 只畫開車段（segments 裡 mode = drive）；捷運、YouBike 那段不畫線，
@@ -309,6 +445,10 @@ export default function Map({
   url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}"
   maxNativeZoom={18}
   maxZoom={19}
+  // 縮放動畫進行中不載入新圖磚，結束後再一次載入（減少動畫中的網路請求與重繪）
+  updateWhenZooming={false}
+  // 畫面外多保留幾圈圖磚，拖回來時不用重新下載
+  keepBuffer={4}
 />
 
       <FlyToLocation start={start} end={end} />
@@ -316,70 +456,21 @@ export default function Map({
       <MapEventHandler onMapMove={onMapMove} onZoomChange={setZoom} />
 
       {/* ── 停車場（永遠顯示，cluster 整合）── */}
-      <MarkerClusterGroup chunkedLoading iconCreateFunction={createCustomClusterIcon}>
-        {data.map((item, index) => (
-          <Marker key={index} position={[item.lat, item.lng]} icon={customIcon}>
-            <Popup autoPan={false}>
-              <b>{item.name}</b><br />
-              {item.address}<br />
-              剩餘汽車位：{formatCarAvailability(item.available_count)}<br />
-              剩餘機車位：{item.available_motor}<br />
-              {item.payex && <><small>{item.payex}</small><br /></>}
-              {item.updatetime && (
-                <small style={{ color: '#888' }}>
-                  更新：{formatApiTime(item.updatetime)}
-                </small>
-              )}
-              </Popup>
-            </Marker>
-        ))}
+      <MarkerClusterGroup {...CLUSTER_OPTIONS} iconCreateFunction={createCustomClusterIcon}>
+        {lotMarkers}
       </MarkerClusterGroup>
 
       {/* ── 捷運出口（zoom >= 14，cluster 整合）── */}
       {zoom >= ZOOM_SHOW_MRT && (
-        <MarkerClusterGroup chunkedLoading iconCreateFunction={createMrtClusterIcon}>
-          {mrtExits.map((exit) => (
-            <Marker
-              key={`mrt-${exit.station_id}-${exit.exit_id}`}
-              position={[exit.lat, exit.lon]}
-              icon={mrtExitIcon}
-            >
-              <Popup autoPan={false}>
-                <b>{exit.station_name_zh} {exit.exit_name_zh}</b><br />
-                {exit.location_description}<br />
-                {exit.has_stair ? '有樓梯　' : ''}
-                {exit.has_elevator ? '有電梯　' : ''}
-                {exit.escalator_count > 0 ? `手扶梯 ${exit.escalator_count} 座` : ''}
-              </Popup>
-            </Marker>
-          ))}
+        <MarkerClusterGroup {...CLUSTER_OPTIONS} iconCreateFunction={createMrtClusterIcon}>
+          {mrtMarkers}
         </MarkerClusterGroup>
       )}
 
       {/* ── YouBike 站點（zoom >= 15，cluster 整合）── */}
       {zoom >= ZOOM_SHOW_UBIKE && (
-        <MarkerClusterGroup chunkedLoading iconCreateFunction={createUbikeClusterIcon}>
-          {ubikeStations.map((station) => (
-            <Marker
-              key={`ubike-${station.station_uid}`}
-              position={[station.lat, station.lon]}
-              icon={ubikeIcon}
-            >
-              <Popup autoPan={false}>
-                <b>{station.name_zh}</b><br />
-                {station.address_zh}<br />
-                可借：{station.available_rent ?? '-'} 台
-                可還：{station.available_return ?? '-'} 格<br />
-                電動車：{station.electric_bikes ?? '-'} 台<br />
-                站點容量：{station.bikes_capacity}<br />
-                {station.update_time && (
-                  <small style={{ color: '#888' }}>
-                    更新：{formatApiTime(station.update_time)}
-                  </small>
-                )}
-              </Popup>
-            </Marker>
-          ))}
+        <MarkerClusterGroup {...CLUSTER_OPTIONS} iconCreateFunction={createUbikeClusterIcon}>
+          {ubikeMarkers}
         </MarkerClusterGroup>
       )}
 
@@ -388,44 +479,8 @@ export default function Map({
           有充電樁的用 roadside-parking-charging.png 圖示
       */}
       {zoom >= ZOOM_SHOW_ROADSIDE && (
-        <MarkerClusterGroup chunkedLoading iconCreateFunction={createRoadsideClusterIcon}>
-          {roadsideSpots
-            .filter((spot) => typeof spot.lat === 'number' && typeof spot.lng === 'number')
-            .map((spot) => {
-              const statusInfo = getRoadsideStatusInfo(spot.status);
-              const iconSet = roadsideIconByStatus[spot.status] ?? roadsideIconUnknown;
-              const icon = spot.has_charging ? iconSet.charging : iconSet.normal;
-              return (
-                <Marker
-                  key={`roadside-${spot.pkid}`}
-                  position={[spot.lat, spot.lng]}
-                  icon={icon}
-                >
-                  <Popup autoPan={false}>
-                    <b>路邊停車格 {spot.pkid}</b><br />
-                    {spot.segment_name_zh && <>路段：{spot.segment_name_zh}<br /></>}
-                    狀態：<span style={{ color: statusInfo.color, fontWeight: 'bold' }}>{statusInfo.label}</span><br />
-                    {spot.has_charging && <>⚡ 有充電樁<br /></>}
-                    {spot.feeSchedule && spot.feeSchedule.length > 0 && (
-                      <>
-                        收費：
-                        {spot.feeSchedule.map((f, i) => (
-                          <div key={i} style={{ marginLeft: 8 }}>
-                            {f.startTime}–{f.endTime}：${f.price}
-                            {f.rateName && <small style={{ color: '#888' }}>（{f.rateName}）</small>}
-                          </div>
-                        ))}
-                      </>
-                    )}
-                    {spot.distance_km != null && (
-                      <small style={{ color: '#888' }}>
-                        距離：{spot.distance_km.toFixed(2)} 公里
-                      </small>
-                    )}
-                  </Popup>
-                </Marker>
-              );
-            })}
+        <MarkerClusterGroup {...CLUSTER_OPTIONS} iconCreateFunction={createRoadsideClusterIcon}>
+          {roadsideMarkers}
         </MarkerClusterGroup>
       )}
 

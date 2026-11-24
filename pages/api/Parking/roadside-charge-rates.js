@@ -1,13 +1,4 @@
-const TEAMMATE_BASE = 'https://my-app-five-chi-20.vercel.app';
+// 路邊停車費率表（幾乎不變，長快取）
+import { createProxy, CACHE } from '../../../lib/teammateProxy';
 
-export default async function handler(req, res) {
-  try {
-    const upstream = await fetch(`${TEAMMATE_BASE}/api/parking/roadside-charge-rates`);
-    if (!upstream.ok) throw new Error(`upstream HTTP ${upstream.status}`);
-
-    const data = await upstream.json();
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message || JSON.stringify(err) });
-  }
-}
+export default createProxy('/api/parking/roadside-charge-rates', { cache: CACHE.static });

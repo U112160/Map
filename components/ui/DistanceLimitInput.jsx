@@ -1,4 +1,4 @@
-// 距離上限輸入框：跟 PriceLimitInput 同一套樣式，只是單位換成公尺，用來讓使用者自訂「停車後最遠願意走/騎/搭多遠」
+// 距離上限輸入框：用來讓使用者自訂「停車後最遠願意走/騎/搭多遠」
 export function DistanceLimitInput({ label, value, onChange, placeholder = '例如：500' }) {
   return (
     <div style={{ marginBottom: 14 }}>

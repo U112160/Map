@@ -31,6 +31,23 @@ const MapView = dynamic(
 // 重新打開路邊停車格的抓取
 const ENABLE_ROADSIDE_PARKING = true;
 
+// 停車場/YouBike/捷運出口的查詢半徑（公里）
+const FETCH_RADIUS = 3;
+// 路邊停車格只在 zoom >= 16 才顯示，畫面只看得到一小塊，用小半徑查快很多
+const ROADSIDE_FETCH_RADIUS = 0.6;
+const ZOOM_SHOW_ROADSIDE = 16; // 要跟 components/Map.jsx 的同名常數一致
+// 查詢中心點對齊的網格大小（度）。0.01° ≈ 1.1 公里、0.002° ≈ 220 公尺
+const BASE_GRID = 0.01;
+const ROADSIDE_GRID = 0.002;
+
+function snapToGrid({ lat, lng }, step) {
+  const decimals = Math.max(0, Math.ceil(-Math.log10(step)));
+  const snap = (v) => Number((Math.round(v / step) * step).toFixed(decimals));
+  const sLat = snap(lat);
+  const sLng = snap(lng);
+  return { lat: sLat, lng: sLng, key: `${sLat},${sLng}` };
+}
+
 // 隊友的 /api/parking/lots 有時候 lat/lon 兩個欄位會反過來
 // （例如 lon 欄位裡放的其實是緯度）。台灣緯度大約在 21~26 之間、
 // 經度大約在 118~123 之間，用這個範圍自動偵測、抓反就自動校正，
@@ -96,18 +113,16 @@ export default function MapPage() {
   const [isPlanning, setIsPlanning] = useState(false);
   // 目前「Maps」按鈕要帶去 /navigate 分頁的是第幾段（多段路線時用）
   const [activeLegIndex, setActiveLegIndex] = useState(0);
-  const FETCH_RADIUS = 3; // 公里，可自行調整（停車場/YouBike/捷運出口用）
-  // 路邊停車格那支 API 實測 radius=3 要 20 秒，非常慢；反正路邊停車格要
-  // zoom >= 16 才會顯示，那時候畫面本來就只看得到一小塊範圍，縮小查詢半徑
-  // 大幅減少隊友那邊要查的資料量，回應速度會快很多
-  const ROADSIDE_FETCH_RADIUS = 0.6; // 公里
   const fetchDebounceRef = useRef(null);
-  // 每次呼叫 fetchAllData 就 +1；非同步回來時比對這個值，
-  // 不是「最新一次」的回應就丟掉，避免比較慢的舊請求把新資料蓋掉
-  const requestIdRef = useRef(0);
-  // 上一輪還沒回來的請求，開始新一輪時直接中止，
-  // 避免舊請求一直占著連線，把新請求排在後面拖慢
-  const abortControllerRef = useRef(null);
+  // 停車場/YouBike/捷運 與 路邊停車格 各自一組 requestId + AbortController，
+  // 互不干擾：移動地圖時只中止同一類的舊請求
+  const baseRequestIdRef = useRef(0);
+  const baseAbortRef = useRef(null);
+  const roadsideRequestIdRef = useRef(0);
+  const roadsideAbortRef = useRef(null);
+  // 路段收費資料快取（segment_id → charge 或 null），收費時段幾乎不會變，
+  // 抓過的路段整個 session 都不用再抓
+  const chargeCacheRef = useRef(new Map());
 
   // 上一次真正套用到畫面上的資料「內容特徵」，重新抓到資料後先比對，
   // 內容其實沒變就直接跳過 setState，連那一次重新渲染都不要發生
@@ -122,7 +137,7 @@ export default function MapPage() {
   }
 
   // 收費費率表（rate_id → 費率資料）：整份表不吃座標參數，只在掛載時抓一次，
-  // 不用跟著地圖移動重抓。用 ref 存一份給 fetchAllData（它是空 deps 的
+  // 不用跟著地圖移動重抓。用 ref 存一份給 fetchRoadsideData（它是空 deps 的
   // useCallback）讀最新值，避免閉包抓到舊的 state。
   const [rateTable, setRateTable] = useState(new Map());
   const rateTableRef = useRef(rateTable);
@@ -132,6 +147,12 @@ export default function MapPage() {
 
   // Toast 通知（目前只印 Console，不顯示畫面提示）
   const { toasts, addToast, removeToast } = useToast();
+
+  // 一打開網頁就先叫醒 Render 上的演算法服務（免費方案閒置會休眠），
+  // 使用者填表單的這段時間服務就醒了，按規劃時不用再等冷啟動
+  useEffect(() => {
+    fetch('/api/warmup').catch(() => {});
+  }, []);
 
   // 收費費率表：掛載時抓一次（不吃座標參數，整份表）
   useEffect(() => {
@@ -544,29 +565,18 @@ export default function MapPage() {
     window.open(buildGoogleMapsUrl(leg), '_blank');
   }
 
-  // 依地圖中心點 + 半徑抓資料（地圖移動時也會重抓）
-  //
-  // 混合式更新策略：
-  // - 停車場／捷運出口／YouBike 這三種通常速度差不多快，一起等齊了
-  //   才一次性 setState，讓 React 18 合併成一次重新渲染，減少
-  //   react-leaflet-cluster 的 popup 閃爍（issue #38）。
-  // - 路邊停車格那支明顯比較慢，獨立處理、不跟前三個綁在一起等，
-  //   不然它一慢，會連帶拖累「其實早就查好了」的停車場資料，
-  //   變成畫面上什麼都看不到。它多慢就多慢，自己準備好自己更新。
-  const fetchAllData = useCallback(async (center) => {
-    const requestId = ++requestIdRef.current;
-
-    // 中止上一輪還沒回來的請求，釋放連線給這一輪用
-    if (abortControllerRef.current) abortControllerRef.current.abort();
+  // ── 停車場／捷運出口／YouBike（半徑 FETCH_RADIUS） ──
+  // 三種一起等齊才一次 setState，讓 React 合併成一次重新渲染，
+  // 減少 react-leaflet-cluster 的 popup 閃爍（issue #38）
+  const fetchBaseData = useCallback(async (center) => {
+    const requestId = ++baseRequestIdRef.current;
+    if (baseAbortRef.current) baseAbortRef.current.abort();
     const controller = new AbortController();
-    abortControllerRef.current = controller;
+    baseAbortRef.current = controller;
     const { signal } = controller;
 
     const { lat, lng } = center;
     const q = `center_lat=${lat}&center_lon=${lng}&radius=${FETCH_RADIUS}`;
-    // 路邊停車格只在 zoom >= 16（很近的距離）才會顯示，用比較小的半徑查，
-    // 減少隊友那邊要查的資料量，減輕那支 API 很慢的問題
-    const qRoadside = `center_lat=${lat}&center_lon=${lng}&radius=${ROADSIDE_FETCH_RADIUS}`;
 
     // ── 捷運出口：算出結果，不直接 setState ──
     const fetchMrt = async () => {
@@ -683,7 +693,7 @@ export default function MapPage() {
       fetchUbike(),
     ]);
 
-    if (requestIdRef.current === requestId) {
+    if (baseRequestIdRef.current === requestId) {
       // 一次套用，讓 React 18 合併成一次重新渲染；內容沒變就直接跳過
       if (mrtRes.status === 'fulfilled') setIfChanged('mrtExits', setMrtExits, mrtRes.value);
       else setIfChanged('mrtExits', setMrtExits, []);
@@ -708,146 +718,156 @@ export default function MapPage() {
         addToast('warning', 'YouBike 即時借還資料載入失敗', ubikeRes.value.warning);
       }
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-    // 路邊停車格：分兩步
-    // 1) /api/Parking/roadside-spots（座標/segment_id/space_type/has_charging）
-    //    + /api/Parking/roadside-charge（收費時段，用 segment_id 對應）可以平行打
-    // 2) /api/Parking/roadside-status 現在改用 pkid 查（逗號分隔多筆），
-    //    要先有第 1 步的 pkid 清單才能查，沒辦法跟第 1 步平行
-    // 這支明顯比較慢，獨立跑、不跟前三種資料綁在一起等，才不會拖累它們的顯示
-    if (ENABLE_ROADSIDE_PARKING) {
-      (async () => {
+  // ── 路邊停車格（只在 zoom >= ZOOM_SHOW_ROADSIDE 才抓） ──
+  // 1) roadside-spots（座標/segment_id/space_type/has_charging）
+  // 2) roadside-status 用 pkid 逗號串一次查即時狀態
+  // 3) roadside-charge 只能一次查一個 segment_id，沒抓過的路段才平行補抓，
+  //    結果存在 chargeCacheRef（隊友的整份表只回 100 筆，對不上附近路段）
+  // 2、3 都要等 1 的結果，但彼此可以平行
+  const fetchRoadsideData = useCallback(async (center) => {
+    const requestId = ++roadsideRequestIdRef.current;
+    if (roadsideAbortRef.current) roadsideAbortRef.current.abort();
+    const controller = new AbortController();
+    roadsideAbortRef.current = controller;
+    const { signal } = controller;
+    const isStale = () => roadsideRequestIdRef.current !== requestId;
+
+    const { lat, lng } = center;
+    const qRoadside = `center_lat=${lat}&center_lon=${lng}&radius=${ROADSIDE_FETCH_RADIUS}`;
+
+    try {
+      const spotRes = await fetch(`/api/Parking/roadside-spots?${qRoadside}`, { signal });
+      if (!spotRes.ok) throw new Error(`HTTP ${spotRes.status}`);
+      const spots = await spotRes.json();
+      if (isStale()) return;
+
+      const loadStatus = async () => {
+        const pkidList = spots.map((s) => s.pkid).filter(Boolean).join(',');
+        if (!pkidList) return new Map();
         try {
-          const [spotResult, chargeResult] = await Promise.allSettled([
-            fetch(`/api/Parking/roadside-spots?${qRoadside}`, { signal }).then((r) => {
-              if (!r.ok) throw new Error(`HTTP ${r.status}`);
-              return r.json();
-            }),
-            fetch(`/api/Parking/roadside-charge`, { signal }).then((r) => {
-              if (!r.ok) throw new Error(`HTTP ${r.status}`);
-              return r.json();
-            }),
-          ]);
-
-          if (requestIdRef.current !== requestId) return; // 舊請求，不理它
-
-          if (spotResult.status !== 'fulfilled') {
-            addToast('warning', '路邊停車格資料載入失敗', `${spotResult.reason}，部分地圖資訊可能不顯示`);
-            setIfChanged('roadsideSpots', setRoadsideSpots, []);
-            return;
-          }
-          const spots = spotResult.value;
-
-          let chargeBySegment = new Map();
-          if (chargeResult.status === 'fulfilled') {
-            chargeBySegment = new Map(chargeResult.value.map((c) => [c.segment_id, c]));
-          } else {
-            addToast('warning', '路邊停車收費資料載入失敗', `${chargeResult.reason}，車格仍會顯示但不會顯示收費資訊`);
-          }
-
-          // 第 2 步：用第 1 步拿到的 pkid 清單，逗號分隔一次查即時狀態
-          let statusByPkid = new Map();
-          const pkidList = spots.map((s) => s.pkid).filter(Boolean).join(',');
-          if (pkidList) {
-            try {
-              const statusRes = await fetch(`/api/Parking/roadside-status?pkid=${encodeURIComponent(pkidList)}`, { signal });
-              if (!statusRes.ok) throw new Error(`HTTP ${statusRes.status}`);
-              const statusData = await statusRes.json();
-              statusByPkid = new Map(statusData.map((s) => [s.pkid, s]));
-            } catch (err) {
-              addToast('warning', '路邊停車格即時狀態載入失敗', `${err.message}，車格仍會顯示但狀態可能不是最新`);
-            }
-          }
-
-          if (requestIdRef.current !== requestId) return; // 舊請求，不理它
-
-          const rates = rateTableRef.current;
-
-          const merged = spots
-            .filter((s) => typeof s.lat === 'number' && typeof s.lon === 'number')
-            .map((s) => {
-              const st = statusByPkid.get(s.pkid) || {};
-              const charge = chargeBySegment.get(s.segment_id);
-
-              // 把收費時段裡的 RateID 換成實際價格（Rates 陣列取第一筆當代表）
-              let feeSchedule = [];
-              if (charge && Array.isArray(charge.charge_times)) {
-                feeSchedule = charge.charge_times
-                  .map((ct) => {
-                    const rateId = ct.Rates?.[0]?.RateID;
-                    const rate = rateId != null ? rates.get(String(rateId)) : null;
-                    if (!rate) return null;
-                    return {
-                      startTime: ct.StartTime,
-                      endTime:   ct.EndTime,
-                      price:     rate.rate_price,
-                      rateName:  rate.rate_name,
-                    };
-                  })
-                  .filter(Boolean);
-              }
-
-              return {
-                pkid:            s.pkid,
-                lat:              s.lat,
-                lng:              s.lon,
-                segment_id:       s.segment_id,
-                segment_name_zh:  charge?.segment_name_zh ?? null,
-                space_type:       s.space_type,
-                has_charging:     !!s.has_charging,
-                status:           String(st.status ?? s.status ?? '0'),
-                distance_km:      s.distance_km != null ? parseFloat(s.distance_km) : null,
-                update_time:      s.update_time,
-                feeSchedule,
-              };
-            });
-          setIfChanged('roadsideSpots', setRoadsideSpots, merged);
+          const r = await fetch(`/api/Parking/roadside-status?pkid=${encodeURIComponent(pkidList)}`, { signal });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const statusData = await r.json();
+          return new Map(statusData.map((s) => [s.pkid, s]));
         } catch (err) {
-          if (requestIdRef.current !== requestId) return;
           if (err.name !== 'AbortError') {
-            addToast('warning', '路邊停車格資料載入失敗', `${err.message}，部分地圖資訊可能不顯示`);
-            setIfChanged('roadsideSpots', setRoadsideSpots, []);
+            addToast('warning', '路邊停車格即時狀態載入失敗', `${err.message}，車格仍會顯示但狀態可能不是最新`);
           }
+          return new Map();
         }
-      })();
-    } else {
+      };
+
+      const loadCharges = async () => {
+        const cache = chargeCacheRef.current;
+        const missing = [...new Set(spots.map((s) => s.segment_id).filter(Boolean))]
+          .filter((id) => !cache.has(id));
+        const results = await Promise.allSettled(
+          missing.map((id) =>
+            fetch(`/api/Parking/roadside-charge?segment_id=${encodeURIComponent(id)}`, { signal })
+              .then((r) => {
+                if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                return r.json();
+              })
+              .then((rows) => [id, Array.isArray(rows) ? rows[0] ?? null : rows ?? null]),
+          ),
+        );
+        let failed = 0;
+        for (const r of results) {
+          if (r.status === 'fulfilled') cache.set(r.value[0], r.value[1]);
+          else if (r.reason?.name !== 'AbortError') failed += 1; // 失敗的不寫入快取，下次再試
+        }
+        if (failed) {
+          addToast('warning', '路邊停車收費資料載入失敗', `${failed} 個路段查詢失敗，車格仍會顯示但不會顯示收費資訊`);
+        }
+        return cache;
+      };
+
+      const [statusByPkid, chargeCache] = await Promise.all([loadStatus(), loadCharges()]);
+      if (isStale()) return;
+
+      const rates = rateTableRef.current;
+
+      const merged = spots
+        .filter((s) => typeof s.lat === 'number' && typeof s.lon === 'number')
+        .map((s) => {
+          const st = statusByPkid.get(s.pkid) || {};
+          const charge = chargeCache.get(s.segment_id);
+
+          // 把收費時段裡的 RateID 換成實際價格（Rates 陣列取第一筆當代表）
+          let feeSchedule = [];
+          if (charge && Array.isArray(charge.charge_times)) {
+            feeSchedule = charge.charge_times
+              .map((ct) => {
+                const rateId = ct.Rates?.[0]?.RateID;
+                const rate = rateId != null ? rates.get(String(rateId)) : null;
+                if (!rate) return null;
+                return {
+                  startTime: ct.StartTime,
+                  endTime:   ct.EndTime,
+                  price:     rate.rate_price,
+                  rateName:  rate.rate_name,
+                };
+              })
+              .filter(Boolean);
+          }
+
+          return {
+            pkid:            s.pkid,
+            lat:              s.lat,
+            lng:              s.lon,
+            segment_id:       s.segment_id,
+            segment_name_zh:  charge?.segment_name_zh ?? null,
+            space_type:       s.space_type,
+            has_charging:     !!s.has_charging,
+            status:           String(st.status ?? s.status ?? '0'),
+            distance_km:      s.distance_km != null ? parseFloat(s.distance_km) : null,
+            update_time:      s.update_time,
+            feeSchedule,
+          };
+        });
+      setIfChanged('roadsideSpots', setRoadsideSpots, merged);
+    } catch (err) {
+      if (isStale() || err.name === 'AbortError') return;
+      addToast('warning', '路邊停車格資料載入失敗', `${err.message}，部分地圖資訊可能不顯示`);
       setIfChanged('roadsideSpots', setRoadsideSpots, []);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 地圖移動結束後，debounce 800ms 再重抓（避免拖動時一直打 API）
-  // 上一次真正拿去打 API 的地圖中心點，用來過濾掉太小的移動
-  // （例如點 marker 開 popup 時 Leaflet 的 autoPan 只是輕輕挪一下地圖，
-  // 這種小幅移動不需要重抓資料，不然會一直循環：開 popup → autoPan →
-  // moveend → 重抓資料 → 重新渲染 marker → 又觸發一次 moveend）
-  const lastFetchCenterRef = useRef(null);
-  const MIN_MOVE_DEGREES = 0.001; // 約 100 公尺，小於這個距離不重抓
+  // 地圖移動結束後 debounce 800ms 再決定要不要重抓。
+  // 中心點先對齊到網格（BASE_GRID / ROADSIDE_GRID），同一格就不重抓：
+  // - 點 marker 開 popup 時 autoPan 的小幅移動不會觸發重抓（避免 popup 閃爍循環）
+  // - 不同使用者在附近看地圖時，送出的座標相同，Vercel CDN 可以共用快取
+  const lastBaseCellRef = useRef(null);
+  const lastRoadsideCellRef = useRef(null);
 
-  const handleMapMove = useCallback((center) => {
-    const last = lastFetchCenterRef.current;
-    if (last) {
-      const moved = Math.abs(center.lat - last.lat) + Math.abs(center.lng - last.lng);
-      if (moved < MIN_MOVE_DEGREES) return; // 移動太小（很可能是 autoPan），不重抓
-    }
-
+  const handleMapMove = useCallback(({ lat, lng, zoom }) => {
     if (fetchDebounceRef.current) clearTimeout(fetchDebounceRef.current);
     fetchDebounceRef.current = setTimeout(() => {
-      lastFetchCenterRef.current = center;
-      fetchAllData(center);
-    }, 800);
-  }, [fetchAllData]);
+      const base = snapToGrid({ lat, lng }, BASE_GRID);
+      if (base.key !== lastBaseCellRef.current) {
+        lastBaseCellRef.current = base.key;
+        fetchBaseData(base);
+      }
 
-  // 初始載入：以台北市中心為預設
+      // 路邊停車格只有 zoom >= 16 才看得到，太遠時完全不抓
+      if (!ENABLE_ROADSIDE_PARKING || zoom < ZOOM_SHOW_ROADSIDE) return;
+      const rs = snapToGrid({ lat, lng }, ROADSIDE_GRID);
+      if (rs.key !== lastRoadsideCellRef.current) {
+        lastRoadsideCellRef.current = rs.key;
+        fetchRoadsideData(rs);
+      }
+    }, 800);
+  }, [fetchBaseData, fetchRoadsideData]);
+
+  // 初始載入：以台北市中心為預設（初始 zoom 13，不抓路邊停車格）
   useEffect(() => {
-    // fetchAllData 裡面的 setState 全部包在 fetch().then() 裡（非同步），
-    // 不是規則真正要抓的「effect body 裡同步呼叫 setState」，這是已知的
-    // lint 誤判（react-hooks/set-state-in-effect 目前對這種「呼叫外部函式，
-    // 內部才非同步 setState」的寫法沒辦法正確判斷）
-    const initialCenter = { lat: 25.0330, lng: 121.5654 };
-    lastFetchCenterRef.current = initialCenter;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    fetchAllData(initialCenter);
+    const base = snapToGrid({ lat: 25.0330, lng: 121.5654 }, BASE_GRID);
+    lastBaseCellRef.current = base.key;
+    fetchBaseData(base);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

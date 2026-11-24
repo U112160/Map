@@ -1,0 +1,31 @@
+# Render 免費方案閒置 15 分鐘就會休眠，冷啟動要等 30~60 秒。
+# 每 10 分鐘打一次 /health 讓演算法服務保持清醒。
+# 注意：
+# - GitHub 排程只在預設分支（main）上執行，時間可能延遲幾分鐘
+# - repo 連續 60 天沒有任何 commit，GitHub 會自動停用排程，要到 Actions 頁面重新啟用
+# - Render 免費方案每月 750 小時，一個服務 24 小時開著（約 744 小時）剛好夠用；
+#   同一個 Render 帳號如果還有其他免費服務，時數會一起扣
+name: Keep Render warm
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping algorithm service
+        env:
+          # 可在 repo Settings → Secrets and variables → Actions → Variables 設定 ALGORITHM_SERVICE_URL 覆蓋
+          URL: ${{ vars.ALGORITHM_SERVICE_URL || 'https://pythonapplication1-hetn.onrender.com' }}
+        run: |
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 90 "$URL/health") || code=000
+            echo "attempt $i: HTTP $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "::warning::algorithm service did not return 200"
